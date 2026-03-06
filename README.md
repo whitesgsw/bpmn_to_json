@@ -3,7 +3,7 @@
 A lightweight desktop app for drawing BPMN-style diagrams, editing them in JSON, and importing/exporting BPMN XML/JSON. Built with Tkinter.
 
 ## Note to Users:
-**If you want to contribute and add features to the project, feel free to submit a pull request. For feature requests and raising issues please submit through the repo's Issue tab.
+**If you want to contribute and add features to the project, feel free to submit a pull request. For feature requests and raising issues please submit through the repo's Issue tab.**
 
 ## Features
 - **Graphical editor** with grid & panning, undo/redo, and a left toolbar for nodes: Start/End events, Task, Exclusive Gateway, Swimlane, Pool.  
