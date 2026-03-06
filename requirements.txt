@@ -1,0 +1,4 @@
+# Third-party packages required by this app
+# - Tkinter is part of the standard Python distribution (no pip package). On some Linux distros you may need the system package: python3-tk / tkinter.
+# - Pillow is optional, only needed if you want to export PNG (File → Export PNG…).
+Pillow>=10.0.0

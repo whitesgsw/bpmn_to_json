@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BPMN Studio – FINAL (clean) build
+BPMN Studio
 
-Addresses the issues reported:
-- Lanes import reliably from BPMN (using namespaces + DI Bounds) and render immediately
-- Lanes selectable even when edges are on top (lane-under-edge fallback)
-- Lanes movable (drag body) and resizable (8 handles); label is TOP-RIGHT, horizontal
-- Layering: grid < pool < lane < edge < node < lane_handle (normalized after actions)
-- Message Flow tool restored (Connect → Sequence Flow / Message Flow) + click logic
-- Undo/Redo bindings restored (Ctrl+Z / Ctrl+Y and mac Cmd variants)
-- Right-click context menu: Delete / Bring forward / Send backward
-- Selection accuracy fixed (canvasx/canvasy); no accidental selection elsewhere
-- Delete acts on explicit selection only (no implicit deletions)
+Tool is used to structure BPMN diagrams into JSON objects ready to be consumed by LLM models.
+The purpose of this tool is to be able to model BPMN in graphical interface as well as a JSON structure and convert between formats.
+Converting the base XML strucure to JSON increases the likelihood of correct LLM interpretation and decrease the token count compared to raw XML. 
+The tool also supports exporting to BPMN XML format for compatibility with other BPMN tools.
 
 Run:
-  python bpmn_studio_final.py
+  python bpmn_studio.py
 """
 import json
 import os
