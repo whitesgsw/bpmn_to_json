@@ -13,6 +13,7 @@ The tool also supports exporting to BPMN XML format for compatibility with other
 Run:
   python bpmn_studio.py
 """
+import copy
 import json
 import os
 import tkinter as tk
@@ -20,7 +21,7 @@ from tkinter import filedialog, messagebox, simpledialog, colorchooser
 import xml.etree.ElementTree as ET
 
 # Optional PNG export via Pillow.
-# NOTE: converting PostScript → PNG also requires Ghostscript to be installed on the system.
+# NOTE: converting PostScript -> PNG also requires Ghostscript to be installed on the system.
 try:
     from PIL import Image
     PIL_AVAILABLE = True
@@ -32,7 +33,9 @@ class Node:
     def __init__(self, nid, ntype, x, y, w=120, h=60, text=None, lane_id=None,
                  fill=None, outline=None, text_color=None):
         self.id = nid
-        self.type = ntype  # 'startEvent' | 'endEvent' | 'task' | 'exclusiveGateway' | 'lane' | 'pool'
+        self.type = ntype  # 'startEvent' | 'endEvent' | 'task' | 'exclusiveGateway' |
+                           # 'parallelGateway' | 'inclusiveGateway' | 'intermediateEvent' |
+                           # 'lane' | 'pool'
         self.subtype = None  # original BPMN task tag (e.g. 'userTask', 'serviceTask', 'scriptTask')
         self.x = x
         self.y = y
@@ -73,6 +76,18 @@ class Node:
             self.fill = self.fill or "#ffffff"
             self.outline = self.outline or "#ef4444"
             self.text_color = self.text_color or "#ef4444"
+        elif self.type == "parallelGateway":
+            self.fill = self.fill or "#ffffff"
+            self.outline = self.outline or "#3b82f6"
+            self.text_color = self.text_color or "#3b82f6"
+        elif self.type == "inclusiveGateway":
+            self.fill = self.fill or "#ffffff"
+            self.outline = self.outline or "#f59e0b"
+            self.text_color = self.text_color or "#f59e0b"
+        elif self.type == "intermediateEvent":
+            self.fill = self.fill or "#ffffff"
+            self.outline = self.outline or "#f59e0b"
+            self.text_color = self.text_color or "#111827"
         else:
             self.fill = self.fill or "#ffffff"
             self.outline = self.outline or "#111827"
@@ -123,6 +138,9 @@ _TYPE_PREFIX = {
     "endEvent": "EndEvent",
     "task": "Task",
     "exclusiveGateway": "ExclusiveGateway",
+    "parallelGateway": "ParallelGateway",
+    "inclusiveGateway": "InclusiveGateway",
+    "intermediateEvent": "IntermediateEvent",
     "lane": "Lane",
     "pool": "Pool",
 }
@@ -153,6 +171,15 @@ class BPMNModel:
         elif ntype == "exclusiveGateway":
             w, h = 80, 80
             text = "XOR"
+        elif ntype == "parallelGateway":
+            w, h = 80, 80
+            text = "AND"
+        elif ntype == "inclusiveGateway":
+            w, h = 80, 80
+            text = "OR"
+        elif ntype == "intermediateEvent":
+            w, h = 60, 60
+            text = "Event"
         elif ntype == "pool":
             w, h = 1100, 220
             text = "Pool"
@@ -293,7 +320,7 @@ class BPMNStudio(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("BPMN Studio")
-        self.geometry("1200x800")
+        self.geometry("1400x860")
         self.configure(bg=self.BG)
 
         self.model = BPMNModel()
@@ -301,6 +328,13 @@ class BPMNStudio(tk.Tk):
         self.view_mode = "bpmn"
         self._dirty = False
         self._current_tool = tk.StringVar(value="select")
+
+        # Zoom
+        self._zoom = 1.0
+
+        # Snap to grid
+        self._snap_to_grid = True
+        self._snap_var = tk.BooleanVar(value=True)
 
         # Selection/drag state
         self._selected_item = None
@@ -315,6 +349,20 @@ class BPMNStudio(tk.Tk):
         self._resizing_lane = None
         self._dragging_lane = None
 
+        # Multi-select state
+        self._multi_select = set()
+        self._rubber_band_start = None
+        self._rubber_band_item = None
+        self._primary_drag_nid = None
+
+        # Copy/paste clipboard
+        self._clipboard = []
+
+        # Properties panel state
+        self._prop_updating = False
+        self._prop_name_var = tk.StringVar()
+        self._prop_cond_var = tk.StringVar()
+
         # Undo/Redo
         self._history = []
         self._redo = []
@@ -328,9 +376,11 @@ class BPMNStudio(tk.Tk):
         self._build_menu()
         self._build_left_toolbar()
         self._build_main_area()
+        self._build_properties_panel()
         self._bind_canvas_events()
         self._bind_pan_keys()
         self._bind_mouse_wheel()
+        self._bind_keyboard_shortcuts()
 
         # Context menu
         self._ctx_menu = tk.Menu(self, tearoff=0)
@@ -338,17 +388,51 @@ class BPMNStudio(tk.Tk):
         self._ctx_menu.add_separator()
         self._ctx_menu.add_command(label="Bring forward", command=self.ctx_bring_forward)
         self._ctx_menu.add_command(label="Send backward", command=self.ctx_send_backward)
+        self._ctx_menu.add_separator()
+        # Colour cascade submenu for nodes
+        self._colour_menu = tk.Menu(self._ctx_menu, tearoff=0)
+        self._colour_menu.add_command(label="Fill Colour…",
+                                      command=lambda: self._pick_colour("fill"))
+        self._colour_menu.add_command(label="Outline Colour…",
+                                      command=lambda: self._pick_colour("outline"))
+        self._colour_menu.add_command(label="Text Colour…",
+                                      command=lambda: self._pick_colour("text_color"))
+        self._ctx_menu.add_cascade(label="Change Colour…", menu=self._colour_menu)
         self.canvas.bind("<Button-3>", self.on_right_click)
         self.canvas.bind("<Control-Button-1>", self.on_right_click)  # macOS Ctrl+Click
 
-        # Global shortcuts (Undo/Redo)
+        # Global shortcuts (Undo/Redo/Copy/Paste)
         self.bind_all("<Control-z>", lambda e: self.cmd_undo())
         self.bind_all("<Control-y>", lambda e: self.cmd_redo())
         self.bind_all("<Command-z>", lambda e: self.cmd_undo())
         self.bind_all("<Command-Shift-Z>", lambda e: self.cmd_redo())
+        self.bind_all("<Control-c>", lambda e: self.cmd_copy())
+        self.bind_all("<Control-v>", lambda e: self.cmd_paste())
+        self.bind_all("<Control-a>", lambda e: self.cmd_select_all())
 
         self._update_window_title()
         self._push_history("init")
+
+    # -------- Zoom helpers
+    def _mc(self, v):
+        """Convert model coordinate to canvas coordinate."""
+        return v * self._zoom
+
+    def _cm(self, v):
+        """Convert canvas coordinate to model coordinate."""
+        return v / self._zoom
+
+    def zoom_in(self):
+        self._zoom = min(4.0, self._zoom * 1.25)
+        self.redraw_all()
+
+    def zoom_out(self):
+        self._zoom = max(0.25, self._zoom / 1.25)
+        self.redraw_all()
+
+    def zoom_reset(self):
+        self._zoom = 1.0
+        self.redraw_all()
 
     # -------- UI builders
     def _build_menu(self):
@@ -366,30 +450,71 @@ class BPMNStudio(tk.Tk):
         fm.add_command(label="Exit", command=self.destroy)
         self.menubar.add_cascade(label="File", menu=fm)
 
+        em = tk.Menu(self.menubar, tearoff=0)
+        em.add_command(label="Copy", command=self.cmd_copy)
+        em.add_command(label="Paste", command=self.cmd_paste)
+        em.add_command(label="Select All", command=self.cmd_select_all)
+        em.add_separator()
+        em.add_command(label="Auto Layout", command=self.auto_layout)
+        em.add_separator()
+        em.add_command(label="Validate", command=self.validate_diagram)
+        self.menubar.add_cascade(label="Edit", menu=em)
+
         vm = tk.Menu(self.menubar, tearoff=0)
         vm.add_command(label="BPMN View", command=self.toggle_view_bpmn)
         vm.add_command(label="JSON View", command=self.toggle_view_json)
+        vm.add_separator()
+        vm.add_command(label="Zoom In", command=self.zoom_in)
+        vm.add_command(label="Zoom Out", command=self.zoom_out)
+        vm.add_command(label="Reset Zoom", command=self.zoom_reset)
         self.menubar.add_cascade(label="View", menu=vm)
         self.config(menu=self.menubar)
 
     def _build_left_toolbar(self):
         self.toolbar = tk.Frame(self, bg="#ffffff", padx=8, pady=8)
-        def add_btn(lbl, tool):
-            b = tk.Radiobutton(self.toolbar, text=lbl, indicatoron=False, width=18,
+
+        def add_btn(lbl, tool, shortcut=None):
+            display = f"{lbl}  [{shortcut}]" if shortcut else lbl
+            b = tk.Radiobutton(self.toolbar, text=display, indicatoron=False, width=20,
                                value=tool, variable=self._current_tool)
-            b.pack(pady=4, anchor="n", fill="x")
-        add_btn("Select/Move", "select")
-        tk.Label(self.toolbar, text="Add:", bg="#ffffff", anchor="w").pack(fill="x", pady=(16, 4))
-        add_btn("Start Event", "startEvent")
-        add_btn("End Event", "endEvent")
-        add_btn("Task", "task")
-        add_btn("Exclusive Gateway", "exclusiveGateway")
-        add_btn("Swimlane", "lane")
-        add_btn("Pool", "pool")
-        tk.Label(self.toolbar, text="Connect:", bg="#ffffff", anchor="w").pack(fill="x", pady=(16, 4))
-        add_btn("Sequence Flow", "connector")
-        add_btn("Message Flow", "msgConnector")
+            b.pack(pady=3, anchor="n", fill="x")
+
+        add_btn("Select/Move", "select", "s")
+        tk.Label(self.toolbar, text="Add:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
+        add_btn("Start Event", "startEvent", "b")
+        add_btn("End Event", "endEvent", "e")
+        add_btn("Task", "task", "t")
+        add_btn("Exclusive Gateway", "exclusiveGateway", "x")
+        add_btn("Parallel Gateway", "parallelGateway", "p")
+        add_btn("Inclusive Gateway", "inclusiveGateway", "i")
+        add_btn("Intermediate Event", "intermediateEvent", "m")
+        add_btn("Swimlane", "lane", "l")
+        add_btn("Pool", "pool", "o")
+        tk.Label(self.toolbar, text="Connect:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
+        add_btn("Sequence Flow", "connector", "c")
+        add_btn("Message Flow", "msgConnector", "f")
+
+        tk.Label(self.toolbar, text="Zoom:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
+        zoom_frame = tk.Frame(self.toolbar, bg="#ffffff")
+        zoom_frame.pack(fill="x", pady=2)
+        tk.Button(zoom_frame, text="+", width=4, command=self.zoom_in).pack(side=tk.LEFT, padx=1)
+        tk.Button(zoom_frame, text="−", width=4, command=self.zoom_out).pack(side=tk.LEFT, padx=1)
+        tk.Button(zoom_frame, text="100%", width=5, command=self.zoom_reset).pack(side=tk.LEFT, padx=1)
+
+        tk.Label(self.toolbar, text="Options:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
+        snap_cb = tk.Checkbutton(self.toolbar, text="Snap to Grid", bg="#ffffff",
+                                  variable=self._snap_var,
+                                  command=self._on_snap_toggle)
+        snap_cb.pack(anchor="w", pady=2)
+
+        tk.Label(self.toolbar, text="Actions:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
+        tk.Button(self.toolbar, text="Auto Layout", command=self.auto_layout).pack(fill="x", pady=2)
+        tk.Button(self.toolbar, text="Validate", command=self.validate_diagram).pack(fill="x", pady=2)
+
         self.toolbar.pack(side=tk.LEFT, fill=tk.Y)
+
+    def _on_snap_toggle(self):
+        self._snap_to_grid = self._snap_var.get()
 
     def _build_main_area(self):
         self.main_wrap = tk.Frame(self, bg=self.BG)
@@ -400,9 +525,13 @@ class BPMNStudio(tk.Tk):
                                    bg="#e5e7eb", fg="#374151", padx=8, pady=2)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.v_scroll = tk.Scrollbar(self.main_wrap, orient=tk.VERTICAL)
-        self.h_scroll = tk.Scrollbar(self.main_wrap, orient=tk.HORIZONTAL)
-        self.canvas = tk.Canvas(self.main_wrap, bg="#ffffff", highlightthickness=0,
+        # Canvas area frame (left portion of main_wrap)
+        self.canvas_area = tk.Frame(self.main_wrap, bg=self.BG)
+        self.canvas_area.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+
+        self.v_scroll = tk.Scrollbar(self.canvas_area, orient=tk.VERTICAL)
+        self.h_scroll = tk.Scrollbar(self.canvas_area, orient=tk.HORIZONTAL)
+        self.canvas = tk.Canvas(self.canvas_area, bg="#ffffff", highlightthickness=0,
                                 xscrollcommand=self.h_scroll.set,
                                 yscrollcommand=self.v_scroll.set)
         self.canvas.pack(side=tk.TOP, expand=True, fill=tk.BOTH)
@@ -420,6 +549,171 @@ class BPMNStudio(tk.Tk):
 
         self.canvas.bind("<Configure>", self._draw_grid)
         self._update_scrollregion(initial=True)
+
+    def _build_properties_panel(self):
+        """Build the right-side properties panel (220px wide)."""
+        self.prop_panel = tk.Frame(self.main_wrap, bg="#1e293b", width=220)
+        self.prop_panel.pack(side=tk.RIGHT, fill=tk.Y)
+        self.prop_panel.pack_propagate(False)
+
+        tk.Label(self.prop_panel, text="Properties", bg="#1e293b", fg="#f8fafc",
+                 font=("Arial", 12, "bold"), pady=8).pack(fill="x")
+
+        # Inner scrollable content area
+        self.prop_content = tk.Frame(self.prop_panel, bg="#1e293b")
+        self.prop_content.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        self._show_prop_placeholder()
+
+    def _show_prop_placeholder(self):
+        for w in self.prop_content.winfo_children():
+            w.destroy()
+        tk.Label(self.prop_content, text="Select an item\nto view properties",
+                 bg="#1e293b", fg="#64748b", font=("Arial", 10),
+                 justify="center").pack(pady=40)
+
+    def _update_properties_panel(self, obj_id, kind):
+        """Populate the properties panel for the selected object."""
+        for w in self.prop_content.winfo_children():
+            w.destroy()
+
+        if kind in ("node", "pool", "lane"):
+            node = self.model.nodes.get(obj_id)
+            if not node:
+                self._show_prop_placeholder()
+                return
+
+            # Name field
+            tk.Label(self.prop_content, text="Name", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(8, 1))
+            self._prop_updating = True
+            self._prop_name_var.set(node.text or "")
+            self._prop_updating = False
+            name_entry = tk.Entry(self.prop_content, textvariable=self._prop_name_var,
+                                  bg="#334155", fg="#f8fafc", insertbackground="#f8fafc",
+                                  relief="flat", font=("Arial", 10))
+            name_entry.pack(fill="x", pady=(0, 6))
+
+            def on_name_change(*args):
+                if self._prop_updating:
+                    return
+                n = self.model.nodes.get(obj_id)
+                if n:
+                    n.text = self._prop_name_var.get()
+                    self.redraw_all()
+
+            self._prop_name_var.trace_add("write", on_name_change)
+
+            # Type label
+            tk.Label(self.prop_content, text="Type", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(4, 1))
+            tk.Label(self.prop_content, text=node.type, bg="#1e293b", fg="#e2e8f0",
+                     font=("Arial", 10), anchor="w").pack(fill="x", pady=(0, 6))
+
+            # ID label
+            tk.Label(self.prop_content, text="ID", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(4, 1))
+            tk.Label(self.prop_content, text=node.id, bg="#1e293b", fg="#64748b",
+                     font=("Arial", 8), anchor="w", wraplength=200).pack(fill="x", pady=(0, 10))
+
+            # Colours section
+            tk.Label(self.prop_content, text="Colours", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9, "bold"), anchor="w").pack(fill="x", pady=(4, 4))
+
+            def make_colour_row(label_text, attr, current_colour):
+                row = tk.Frame(self.prop_content, bg="#1e293b")
+                row.pack(fill="x", pady=2)
+                tk.Label(row, text=label_text, bg="#1e293b", fg="#e2e8f0",
+                         font=("Arial", 9), width=8, anchor="w").pack(side=tk.LEFT)
+                swatch_colour = current_colour or "#ffffff"
+                swatch = tk.Frame(row, bg=swatch_colour, width=20, height=16,
+                                  relief="solid", bd=1)
+                swatch.pack(side=tk.LEFT, padx=4)
+                swatch.pack_propagate(False)
+
+                def pick(a=attr, s=swatch, nid=obj_id):
+                    n2 = self.model.nodes.get(nid)
+                    if not n2:
+                        return
+                    cur = getattr(n2, a) or "#ffffff"
+                    result = colorchooser.askcolor(color=cur, parent=self,
+                                                   title=f"Choose {a} colour")
+                    if result and result[1]:
+                        setattr(n2, a, result[1])
+                        s.config(bg=result[1])
+                        self.redraw_all()
+                        self._update_properties_panel(nid, "node")
+
+                tk.Button(row, text="Pick…", command=pick,
+                          bg="#334155", fg="#f8fafc", relief="flat",
+                          font=("Arial", 8), padx=4).pack(side=tk.LEFT)
+
+            make_colour_row("Fill", "fill", node.fill)
+            make_colour_row("Outline", "outline", node.outline)
+            make_colour_row("Text", "text_color", node.text_color)
+
+        elif kind == "edge":
+            edge = next((e for e in self.model.edges if e.id == obj_id), None)
+            if not edge:
+                self._show_prop_placeholder()
+                return
+
+            # Name field
+            tk.Label(self.prop_content, text="Name / Label", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(8, 1))
+            self._prop_updating = True
+            self._prop_name_var.set(edge.name or "")
+            self._prop_updating = False
+            name_entry = tk.Entry(self.prop_content, textvariable=self._prop_name_var,
+                                  bg="#334155", fg="#f8fafc", insertbackground="#f8fafc",
+                                  relief="flat", font=("Arial", 10))
+            name_entry.pack(fill="x", pady=(0, 6))
+
+            def on_edge_name_change(*args):
+                if self._prop_updating:
+                    return
+                e2 = next((ex for ex in self.model.edges if ex.id == obj_id), None)
+                if e2:
+                    e2.name = self._prop_name_var.get()
+                    self.redraw_all()
+
+            self._prop_name_var.trace_add("write", on_edge_name_change)
+
+            # Condition field
+            tk.Label(self.prop_content, text="Condition", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(4, 1))
+            self._prop_updating = True
+            self._prop_cond_var.set(edge.condition or "")
+            self._prop_updating = False
+            cond_entry = tk.Entry(self.prop_content, textvariable=self._prop_cond_var,
+                                  bg="#334155", fg="#f8fafc", insertbackground="#f8fafc",
+                                  relief="flat", font=("Arial", 10))
+            cond_entry.pack(fill="x", pady=(0, 6))
+
+            def on_cond_change(*args):
+                if self._prop_updating:
+                    return
+                e2 = next((ex for ex in self.model.edges if ex.id == obj_id), None)
+                if e2:
+                    val = self._prop_cond_var.get()
+                    e2.condition = val if val.strip() else None
+                    self.redraw_all()
+
+            self._prop_cond_var.trace_add("write", on_cond_change)
+
+            # Type label
+            tk.Label(self.prop_content, text="Type", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(4, 1))
+            tk.Label(self.prop_content, text=edge.type, bg="#1e293b", fg="#e2e8f0",
+                     font=("Arial", 10), anchor="w").pack(fill="x", pady=(0, 6))
+
+            # ID label
+            tk.Label(self.prop_content, text="ID", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(4, 1))
+            tk.Label(self.prop_content, text=edge.id, bg="#1e293b", fg="#64748b",
+                     font=("Arial", 8), anchor="w", wraplength=200).pack(fill="x")
+        else:
+            self._show_prop_placeholder()
 
     # -------- Helpers
     def _cx(self, x):
@@ -443,7 +737,7 @@ class BPMNStudio(tk.Tk):
         self.canvas.delete("grid")
         w = self.canvas.winfo_width()
         h = self.canvas.winfo_height()
-        step = self.GRID
+        step = max(2, int(self.GRID * self._zoom))
         for x in range(-5000, w + 5000, step):
             self.canvas.create_line(x, -5000, x, h + 5000, fill="#f0f0f0", tags="grid")
         for y in range(-5000, h + 5000, step):
@@ -461,7 +755,9 @@ class BPMNStudio(tk.Tk):
             self.canvas.config(scrollregion=(-3000, -3000, 3000, 3000))
 
     def snap(self, x, y):
-        return round(x / self.GRID) * self.GRID, round(y / self.GRID) * self.GRID
+        if self._snap_to_grid:
+            return round(x / self.GRID) * self.GRID, round(y / self.GRID) * self.GRID
+        return x, y
 
     def pick_top_item(self, x, y):
         items = self.canvas.find_overlapping(x, y, x, y)
@@ -469,7 +765,7 @@ class BPMNStudio(tk.Tk):
             return None
         for item in reversed(items):
             tags = self.canvas.gettags(item)
-            if "grid" in tags:
+            if "grid" in tags or "sel_indicator" in tags:
                 continue
             return item
         return None
@@ -486,7 +782,7 @@ class BPMNStudio(tk.Tk):
 
     def _stack_layers(self):
         try:
-            for tag in ('grid', 'pool', 'lane', 'edge', 'node', 'lane_handle'):
+            for tag in ('grid', 'pool', 'lane', 'edge', 'node', 'lane_handle', 'sel_indicator'):
                 self.canvas.tag_lower(tag)
             self.canvas.tag_raise('grid')
             self.canvas.tag_raise('pool')
@@ -494,6 +790,7 @@ class BPMNStudio(tk.Tk):
             self.canvas.tag_raise('edge')
             self.canvas.tag_raise('node')
             self.canvas.tag_raise('lane_handle')
+            self.canvas.tag_raise('sel_indicator')
         except Exception:
             pass
 
@@ -534,41 +831,57 @@ class BPMNStudio(tk.Tk):
             self._draw_lane_handles(self.model.nodes[self._active_lane_id])
         self._update_scrollregion()
         self._stack_layers()
+        self._draw_selection_overlays()
 
     # -------- Drawing
     def draw_pool(self, pool_node):
-        x, y, w, h = pool_node.x, pool_node.y, pool_node.w, pool_node.h
+        x = self._mc(pool_node.x)
+        y = self._mc(pool_node.y)
+        w = self._mc(pool_node.w)
+        h = self._mc(pool_node.h)
+        font_size = max(6, int(12 * self._zoom))
         rect = self.canvas.create_rectangle(
             x, y, x + w, y + h,
             fill=pool_node.fill, outline=pool_node.outline, width=2,
             tags=("pool", f"pool:{pool_node.id}"),
         )
         label = self.canvas.create_text(
-            x + 8, y + 16, text=pool_node.text, anchor='w',
-            font=('Arial', 12, 'bold'), fill=pool_node.text_color,
+            x + self._mc(8), y + self._mc(16), text=pool_node.text, anchor='w',
+            font=('Arial', font_size, 'bold'), fill=pool_node.text_color,
             tags=("pool", f"pool:{pool_node.id}"),
         )
         self._node_by_item[rect] = pool_node.id
         self._label_by_item[label] = (pool_node.id, 'pool_label')
 
     def draw_lane(self, lane_node):
-        x, y, w, h = lane_node.x, lane_node.y, lane_node.w, lane_node.h
+        x = self._mc(lane_node.x)
+        y = self._mc(lane_node.y)
+        w = self._mc(lane_node.w)
+        h = self._mc(lane_node.h)
+        font_size = max(6, int(12 * self._zoom))
         rect = self.canvas.create_rectangle(
             x, y, x + w, y + h,
             fill=lane_node.fill, outline=lane_node.outline, width=2,
             tags=("lane", f"lane:{lane_node.id}"),
         )
         label = self.canvas.create_text(
-            x + w - 8, y + 16, text=lane_node.text, anchor='e',
-            font=('Arial', 12, 'bold'), fill=lane_node.text_color,
+            x + w - self._mc(8), y + self._mc(16), text=lane_node.text, anchor='e',
+            font=('Arial', font_size, 'bold'), fill=lane_node.text_color,
             tags=("lane", f"lane:{lane_node.id}"),
         )
         self._node_by_item[rect] = lane_node.id
         self._label_by_item[label] = (lane_node.id, 'lane_label')
 
     def draw_node(self, node):
-        x, y, w, h = node.x, node.y, node.w, node.h
+        x = self._mc(node.x)
+        y = self._mc(node.y)
+        w = self._mc(node.w)
+        h = self._mc(node.h)
+        font_large = max(6, int(11 * self._zoom))
+        font_small = max(6, int(10 * self._zoom))
+        font_marker = max(6, int(12 * self._zoom))
         tag = (f"node:{node.id}", "node")
+
         if node.type in ("startEvent", "endEvent"):
             r = min(w, h) / 2
             cx, cy = x + w / 2, y + h / 2
@@ -578,26 +891,54 @@ class BPMNStudio(tk.Tk):
                 fill=node.fill, outline=node.outline, width=ow, tags=tag,
             )
             label = self.canvas.create_text(
-                cx, cy, text=node.text, font=("Arial", 11), fill=node.text_color, tags=tag,
+                cx, cy, text=node.text, font=("Arial", font_large), fill=node.text_color, tags=tag,
             )
             self._node_by_item[oval] = node.id
             self._label_by_item[label] = (node.id, 'node_label')
-        elif node.type == "exclusiveGateway":
+
+        elif node.type == "intermediateEvent":
+            # Double-ring circle
+            r = min(w, h) / 2
+            cx, cy = x + w / 2, y + h / 2
+            outer = self.canvas.create_oval(
+                cx - r, cy - r, cx + r, cy + r,
+                fill=node.fill, outline=node.outline, width=2, tags=tag,
+            )
+            inner_r = r * 0.75
+            self.canvas.create_oval(
+                cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r,
+                fill="", outline=node.outline, width=1, tags=tag,
+            )
+            label = self.canvas.create_text(
+                cx, cy + r + self._mc(12), text=node.text,
+                font=("Arial", font_small), fill=node.text_color, tags=tag,
+            )
+            self._node_by_item[outer] = node.id
+            self._label_by_item[label] = (node.id, 'node_label')
+
+        elif node.type in ("exclusiveGateway", "parallelGateway", "inclusiveGateway"):
             points = [x + w / 2, y, x + w, y + h / 2, x + w / 2, y + h, x, y + h / 2]
             poly = self.canvas.create_polygon(
                 points, fill=node.fill, outline=node.outline, width=2, tags=tag,
             )
+            if node.type == "exclusiveGateway":
+                marker_text = "X"
+            elif node.type == "parallelGateway":
+                marker_text = "+"
+            else:
+                marker_text = "O"
             marker = self.canvas.create_text(
-                x + w / 2, y + h / 2, text="X",
-                font=("Arial", 12, 'bold'), fill=node.text_color, tags=tag,
+                x + w / 2, y + h / 2, text=marker_text,
+                font=("Arial", font_marker, 'bold'), fill=node.text_color, tags=tag,
             )
             text_label = self.canvas.create_text(
-                x + w / 2, y + h + 14, text=node.text,
-                font=("Arial", 10), fill=node.text_color, tags=tag,
+                x + w / 2, y + h + self._mc(14), text=node.text,
+                font=("Arial", font_small), fill=node.text_color, tags=tag,
             )
             self._node_by_item[poly] = node.id
             self._label_by_item[marker] = (node.id, 'gateway_marker')
             self._label_by_item[text_label] = (node.id, 'node_label')
+
         else:
             rect = self.canvas.create_rectangle(
                 x, y, x + w, y + h,
@@ -605,37 +946,100 @@ class BPMNStudio(tk.Tk):
             )
             label = self.canvas.create_text(
                 x + w / 2, y + h / 2, text=node.text,
-                font=("Arial", 11), fill=node.text_color, tags=tag,
+                font=("Arial", font_large), fill=node.text_color, tags=tag,
             )
             self._node_by_item[rect] = node.id
             self._label_by_item[label] = (node.id, 'node_label')
+
+    # -------- Orthogonal edge routing
+    def _connection_point(self, from_node, to_node):
+        """Return the best border point on from_node facing toward to_node (model coords)."""
+        fx = from_node.x + from_node.w / 2
+        fy = from_node.y + from_node.h / 2
+        tx = to_node.x + to_node.w / 2
+        ty = to_node.y + to_node.h / 2
+        dx = tx - fx
+        dy = ty - fy
+        if abs(dx) >= abs(dy):
+            # Mostly horizontal
+            if dx >= 0:
+                return from_node.x + from_node.w, fy
+            else:
+                return from_node.x, fy
+        else:
+            # Mostly vertical
+            if dy >= 0:
+                return fx, from_node.y + from_node.h
+            else:
+                return fx, from_node.y
+
+    def _edge_waypoints(self, src_node, tgt_node):
+        """Return flat list of model-coord waypoints for orthogonal routing."""
+        p1x, p1y = self._connection_point(src_node, tgt_node)
+        p2x, p2y = self._connection_point(tgt_node, src_node)
+        dx = abs(p2x - p1x)
+        dy = abs(p2y - p1y)
+        if dx >= dy:
+            # Horizontal bend
+            mx = (p1x + p2x) / 2
+            return [p1x, p1y, mx, p1y, mx, p2y, p2x, p2y]
+        else:
+            # Vertical bend
+            my = (p1y + p2y) / 2
+            return [p1x, p1y, p1x, my, p2x, my, p2x, p2y]
 
     def draw_edge(self, edge):
         if edge.src not in self.model.nodes or edge.tgt not in self.model.nodes:
             return
         s = self.model.nodes[edge.src]
         t = self.model.nodes[edge.tgt]
-        x1, y1 = self.center_of_node(s)
-        x2, y2 = self.center_of_node(t)
+
+        # Get waypoints in model coords, scale to canvas coords
+        model_pts = self._edge_waypoints(s, t)
+        canvas_pts = [self._mc(v) for v in model_pts]
+
+        font_size = max(6, int(10 * self._zoom))
+
         if edge.type == "sequenceFlow":
             line = self.canvas.create_line(
-                x1, y1, x2, y2, arrow='last', width=2, fill='#111827', tags=("edge",),
+                *canvas_pts, arrow='last', width=2, fill='#111827',
+                smooth=False, tags=("edge",),
             )
         elif edge.type == "messageFlow":
             line = self.canvas.create_line(
-                x1, y1, x2, y2, arrow='last', width=2, dash=(6, 4), fill='#1f2937', tags=("edge",),
+                *canvas_pts, arrow='last', width=2, dash=(6, 4), fill='#1f2937',
+                smooth=False, tags=("edge",),
             )
         else:
             line = self.canvas.create_line(
-                x1, y1, x2, y2, width=2, dash=(2, 3), fill='#6b7280', tags=("edge",),
+                *canvas_pts, width=2, dash=(2, 3), fill='#6b7280',
+                smooth=False, tags=("edge",),
             )
         self._edge_by_item[line] = edge.id
-        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+
+        # Label at midpoint of waypoint list
+        mid_idx = len(canvas_pts) // 2
+        if len(canvas_pts) >= 4:
+            mx = (canvas_pts[mid_idx - 2] + canvas_pts[mid_idx]) / 2
+            my = (canvas_pts[mid_idx - 1] + canvas_pts[mid_idx + 1]) / 2
+        else:
+            mx = (canvas_pts[0] + canvas_pts[-2]) / 2
+            my = (canvas_pts[1] + canvas_pts[-1]) / 2
+
         label = self.canvas.create_text(
-            mx, my - 10, text=edge.name or "",
-            font=("Arial", 10, 'italic'), fill="#374151", tags=("edge",),
+            mx, my - self._mc(10), text=edge.name or "",
+            font=("Arial", font_size, 'italic'), fill="#374151", tags=("edge",),
         )
         self._label_by_item[label] = (edge.id, 'edge_label')
+
+        # Condition label
+        if edge.condition:
+            cond_label = self.canvas.create_text(
+                mx + self._mc(4), my + self._mc(6), text=f"[{edge.condition}]",
+                font=("Arial", max(6, int(8 * self._zoom)), 'italic'),
+                fill="#6b7280", tags=("edge",),
+            )
+            self._label_by_item[cond_label] = (edge.id, 'edge_condition')
 
     # -------- Lane handles (resize)
     def _clear_lane_handles(self):
@@ -645,14 +1049,17 @@ class BPMNStudio(tk.Tk):
 
     def _draw_lane_handles(self, lane_node):
         self._clear_lane_handles()
-        x, y, w, h = lane_node.x, lane_node.y, lane_node.w, lane_node.h
+        x = self._mc(lane_node.x)
+        y = self._mc(lane_node.y)
+        w = self._mc(lane_node.w)
+        h = self._mc(lane_node.h)
         cx, cy = x + w / 2, y + h / 2
         pts = {
             "nw": (x, y), "n": (cx, y), "ne": (x + w, y),
             "e": (x + w, cy), "se": (x + w, y + h),
             "s": (cx, y + h), "sw": (x, y + h), "w": (x, cy),
         }
-        size = 8
+        size = max(4, int(8 * self._zoom))
         for anchor, (hx, hy) in pts.items():
             r = self.canvas.create_rectangle(
                 hx - size / 2, hy - size / 2, hx + size / 2, hy + size / 2,
@@ -662,16 +1069,54 @@ class BPMNStudio(tk.Tk):
         self._stack_layers()
 
     def _update_lane_graphics(self, lane_node):
-        x, y, w, h = lane_node.x, lane_node.y, lane_node.w, lane_node.h
+        x = self._mc(lane_node.x)
+        y = self._mc(lane_node.y)
+        w = self._mc(lane_node.w)
+        h = self._mc(lane_node.h)
         items = self.canvas.find_withtag(f"lane:{lane_node.id}")
         for it in items:
             t = self.canvas.type(it)
             if t == 'rectangle':
                 self.canvas.coords(it, x, y, x + w, y + h)
             elif t == 'text':
-                self.canvas.coords(it, x + w - 8, y + 16)
+                self.canvas.coords(it, x + w - self._mc(8), y + self._mc(16))
         if self._active_lane_id == lane_node.id:
             self._draw_lane_handles(lane_node)
+
+    # -------- Selection overlays
+    def _draw_selection_overlays(self):
+        """Draw dashed blue selection rectangles for all selected nodes."""
+        self.canvas.delete("sel_indicator")
+        pad = 4
+
+        def draw_overlay_for_nid(nid):
+            n = self.model.nodes.get(nid)
+            if not n:
+                return
+            x = self._mc(n.x) - pad
+            y = self._mc(n.y) - pad
+            x2 = self._mc(n.x + n.w) + pad
+            y2 = self._mc(n.y + n.h) + pad
+            self.canvas.create_rectangle(
+                x, y, x2, y2,
+                outline="#2563eb", width=2, dash=(4, 3), fill="",
+                tags=("sel_indicator",),
+            )
+
+        if self._multi_select:
+            for nid in self._multi_select:
+                draw_overlay_for_nid(nid)
+        elif self._selected_item and self._selected_type in ("node", "pool", "lane"):
+            nid = self.item_to_node_id(self._selected_item)
+            if not nid and self._selected_item in self._label_by_item:
+                nid, _ = self._label_by_item[self._selected_item]
+            if nid:
+                draw_overlay_for_nid(nid)
+
+        try:
+            self.canvas.tag_raise("sel_indicator")
+        except Exception:
+            pass
 
     # -------- Selection & Interaction
     def get_item_kind(self, item_id):
@@ -706,6 +1151,18 @@ class BPMNStudio(tk.Tk):
     def item_to_edge_id(self, item_id):
         return self._edge_by_item.get(item_id)
 
+    def _resolve_node_id_from_item(self, item):
+        nid = self.item_to_node_id(item)
+        if not nid and item in self._label_by_item:
+            nid, _ = self._label_by_item[item]
+        return nid
+
+    def _resolve_edge_id_from_item(self, item):
+        eid = self.item_to_edge_id(item)
+        if not eid and item in self._label_by_item:
+            eid, _ = self._label_by_item[item]
+        return eid
+
     # -------- Bindings
     def _bind_canvas_events(self):
         self.canvas.bind("<Button-1>", self.on_left_click)
@@ -713,11 +1170,9 @@ class BPMNStudio(tk.Tk):
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Double-Button-1>", self.on_double_click)
         self.bind("<Delete>", self.on_delete)
-        # Panning with middle/right button
+        # Panning with middle button only
         self.canvas.bind("<ButtonPress-2>", self._pan_scan_mark)
         self.canvas.bind("<B2-Motion>", self._pan_scan_dragto)
-        self.canvas.bind("<ButtonPress-3>", self._pan_scan_mark)
-        self.canvas.bind("<B3-Motion>", self._pan_scan_dragto)
 
     def _bind_pan_keys(self):
         self.bind_all("<KeyPress-space>", self._on_space_down)
@@ -727,6 +1182,33 @@ class BPMNStudio(tk.Tk):
         self.canvas.bind_all("<MouseWheel>", self._on_mouse_wheel)
         self.canvas.bind_all("<Button-4>", self._on_mouse_wheel_linux_up)
         self.canvas.bind_all("<Button-5>", self._on_mouse_wheel_linux_down)
+
+    def _bind_keyboard_shortcuts(self):
+        """Bind single-key shortcuts for tools (only when BPMN view is active)."""
+        key_to_tool = {
+            's': 'select',
+            't': 'task',
+            'b': 'startEvent',
+            'e': 'endEvent',
+            'x': 'exclusiveGateway',
+            'p': 'parallelGateway',
+            'i': 'inclusiveGateway',
+            'm': 'intermediateEvent',
+            'l': 'lane',
+            'o': 'pool',
+            'c': 'connector',
+            'f': 'msgConnector',
+        }
+        for key, tool in key_to_tool.items():
+            def make_handler(t):
+                def handler(event):
+                    if self.view_mode != "bpmn":
+                        return
+                    if isinstance(self.focus_get(), (tk.Entry, tk.Text)):
+                        return
+                    self._current_tool.set(t)
+                return handler
+            self.bind_all(key, make_handler(tool))
 
     # -------- Panning
     def _on_space_down(self, event):
@@ -742,19 +1224,30 @@ class BPMNStudio(tk.Tk):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
 
     def _on_mouse_wheel(self, event):
-        if event.state & 0x0001:
+        # Ctrl+scroll = zoom
+        if event.state & 0x0004:
+            if event.delta > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+        elif event.state & 0x0001:
+            # Shift+scroll = horizontal
             self.canvas.xview_scroll(-1 * int(event.delta / 120), "units")
         else:
             self.canvas.yview_scroll(-1 * int(event.delta / 120), "units")
 
     def _on_mouse_wheel_linux_up(self, event):
-        if event.state & 0x0001:
+        if event.state & 0x0004:
+            self.zoom_in()
+        elif event.state & 0x0001:
             self.canvas.xview_scroll(-1, "units")
         else:
             self.canvas.yview_scroll(-1, "units")
 
     def _on_mouse_wheel_linux_down(self, event):
-        if event.state & 0x0001:
+        if event.state & 0x0004:
+            self.zoom_out()
+        elif event.state & 0x0001:
             self.canvas.xview_scroll(1, "units")
         else:
             self.canvas.yview_scroll(1, "units")
@@ -764,10 +1257,24 @@ class BPMNStudio(tk.Tk):
         if self.view_mode != "bpmn":
             return
         cx, cy = self._event_xy_canvas(event)
-        x, y = self.snap(cx, cy)
+        # Convert canvas coords to model coords
+        mx, my = self._cm(cx), self._cm(cy)
+        sx, sy = self.snap(mx, my)
         tool = self._current_tool.get()
         item = self.pick_top_item(cx, cy)
         clicked_kind = self.get_item_kind(item) if item else None
+
+        # Ctrl+click on node = toggle multi-select
+        if event.state & 0x0004 and tool == "select":
+            if clicked_kind in ("node", "pool"):
+                nid = self._resolve_node_id_from_item(item)
+                if nid:
+                    if nid in self._multi_select:
+                        self._multi_select.discard(nid)
+                    else:
+                        self._multi_select.add(nid)
+                    self._draw_selection_overlays()
+                return
 
         # Lane handle resize begin
         if clicked_kind == "lane_handle":
@@ -791,8 +1298,13 @@ class BPMNStudio(tk.Tk):
 
         if tool == "select":
             if clicked_kind is None:
-                self.canvas.scan_mark(event.x, event.y)
+                # Start rubber-band on empty canvas
+                self._multi_select.clear()
+                self._rubber_band_start = (cx, cy)
+                self._rubber_band_item = None
+                self._draw_selection_overlays()
                 return
+
             if clicked_kind == "lane":
                 lane_item = item
                 tags = self.canvas.gettags(lane_item) if lane_item else ()
@@ -810,35 +1322,69 @@ class BPMNStudio(tk.Tk):
                 if nid and nid in self.model.nodes:
                     self._active_lane_id = nid
                     ln = self.model.nodes[nid]
-                    self._dragging_lane = {'lane_id': nid, 'offset': (cx - ln.x, cy - ln.y)}
+                    self._dragging_lane = {'lane_id': nid, 'offset': (mx - ln.x, my - ln.y)}
                     self._selected_item = lane_item
                     self._selected_type = 'lane'
                     self._draw_lane_handles(ln)
                     self._stack_layers()
+                    self._multi_select.clear()
+                    self._draw_selection_overlays()
+                    self._update_properties_panel(nid, "lane")
                 return
+
             # Node / pool / edge
             self._active_lane_id = None
             self._clear_lane_handles()
             self._selected_item = item
             self._selected_type = clicked_kind
+
             if clicked_kind in ("node", "pool"):
-                nid = self.item_to_node_id(item)
-                if not nid and item in self._label_by_item:
-                    nid, _ = self._label_by_item[item]
+                nid = self._resolve_node_id_from_item(item)
                 if nid and nid in self.model.nodes:
                     n = self.model.nodes[nid]
-                    self._drag_offset = (cx - n.x, cy - n.y)
+                    # If node is in multi-select, start multi-drag
+                    if nid in self._multi_select:
+                        self._primary_drag_nid = nid
+                        self._drag_offset = (mx - n.x, my - n.y)
+                    else:
+                        # Single select
+                        self._multi_select.clear()
+                        self._drag_offset = (mx - n.x, my - n.y)
+                        self._update_properties_panel(nid, "node")
                 else:
+                    self._multi_select.clear()
                     self._drag_offset = (0, 0)
+                self._draw_selection_overlays()
+
+            elif clicked_kind == "edge":
+                self._multi_select.clear()
+                eid = self._resolve_edge_id_from_item(item)
+                if eid:
+                    self._update_properties_panel(eid, "edge")
+                self._draw_selection_overlays()
             return
 
-        if tool in ("startEvent", "endEvent", "task", "exclusiveGateway", "lane", "pool"):
-            offset_y = 30 if tool not in ("lane", "pool") else (75 if tool == "lane" else 110)
-            node = self.model.add_node(tool, x - 60, y - offset_y)
-            if tool == "lane":
-                node.x, node.y = 40, max(20, y - 75)
+        # Tool: add node
+        node_tools = ("startEvent", "endEvent", "task", "exclusiveGateway",
+                      "parallelGateway", "inclusiveGateway", "intermediateEvent",
+                      "lane", "pool")
+        if tool in node_tools:
+            self._multi_select.clear()
+            if tool in ("startEvent", "endEvent", "intermediateEvent"):
+                offset_y = 30
+            elif tool in ("exclusiveGateway", "parallelGateway", "inclusiveGateway"):
+                offset_y = 40
+            elif tool == "lane":
+                offset_y = 75
             elif tool == "pool":
-                node.x, node.y = 20, max(10, y - 110)
+                offset_y = 110
+            else:
+                offset_y = 40
+            node = self.model.add_node(tool, sx - 60, sy - offset_y)
+            if tool == "lane":
+                node.x, node.y = 40, max(20, sy - 75)
+            elif tool == "pool":
+                node.x, node.y = 20, max(10, sy - 110)
             if node.type == "lane":
                 self.draw_lane(node)
             elif node.type == "pool":
@@ -851,10 +1397,9 @@ class BPMNStudio(tk.Tk):
             return
 
         if tool in ("connector", "msgConnector"):
+            self._multi_select.clear()
             if clicked_kind in ("node", "pool"):
-                nid = self.item_to_node_id(item)
-                if not nid and item in self._label_by_item:
-                    nid, _ = self._label_by_item[item]
+                nid = self._resolve_node_id_from_item(item)
                 if not self._connect_source:
                     self._connect_source = nid
                     self._flash_message(f"Connector: source={nid}. Click target node.")
@@ -878,6 +1423,19 @@ class BPMNStudio(tk.Tk):
         if self.view_mode != "bpmn":
             return
         cx, cy = self._event_xy_canvas(event)
+        mx, my = self._cm(cx), self._cm(cy)
+
+        # Rubber-band selection
+        if self._rubber_band_start is not None:
+            rbx, rby = self._rubber_band_start
+            if self._rubber_band_item:
+                self.canvas.delete(self._rubber_band_item)
+            self._rubber_band_item = self.canvas.create_rectangle(
+                rbx, rby, cx, cy,
+                outline="#2563eb", width=1, dash=(4, 3), fill="",
+                tags=("sel_indicator",),
+            )
+            return
 
         # Lane resizing
         if self._resizing_lane:
@@ -885,9 +1443,11 @@ class BPMNStudio(tk.Tk):
             if lane_id not in self.model.nodes:
                 return
             anchor = self._resizing_lane["anchor"]
-            sx, sy = self._resizing_lane["start_mouse"]
+            scx, scy = self._resizing_lane["start_mouse"]
             lx, ly, lw, lh = self._resizing_lane["start_geom"]
-            dx, dy = cx - sx, cy - sy
+            # Convert canvas delta to model delta
+            dcx, dcy = cx - scx, cy - scy
+            dx, dy = self._cm(dcx), self._cm(dcy)
             nx, ny, nw, nh = lx, ly, lw, lh
             minw, minh = 200, 80
             if anchor in ("nw", "w", "sw"):
@@ -920,19 +1480,18 @@ class BPMNStudio(tk.Tk):
             if lane_id and lane_id in self.model.nodes:
                 ln = self.model.nodes[lane_id]
                 offx, offy = self._dragging_lane.get('offset', (0, 0))
-                nx, ny = self.snap(cx - offx, cy - offy)
+                nx, ny = self.snap(mx - offx, my - offy)
                 dx, dy = nx - ln.x, ny - ln.y
                 if dx or dy:
-                    # Capture child nodes before moving the lane
                     children = self._nodes_in_lane(ln)
                     ln.x, ln.y = nx, ny
-                    self.canvas.move(f"lane:{lane_id}", dx, dy)
-                    # Move child nodes with the lane
+                    self.canvas.move(f"lane:{lane_id}",
+                                     dx * self._zoom, dy * self._zoom)
                     for n in children:
                         n.x += dx
                         n.y += dy
-                        self.canvas.move(f"node:{n.id}", dx, dy)
-                    # Redraw edges
+                        self.canvas.move(f"node:{n.id}",
+                                         dx * self._zoom, dy * self._zoom)
                     self.canvas.delete("edge")
                     self._edge_by_item.clear()
                     for e in self.model.edges:
@@ -943,21 +1502,49 @@ class BPMNStudio(tk.Tk):
                     self._changed_during_drag = True
             return
 
-        # Node dragging
+        # Multi-node drag
+        if self._multi_select and self._primary_drag_nid:
+            pnid = self._primary_drag_nid
+            if pnid not in self.model.nodes:
+                return
+            pn = self.model.nodes[pnid]
+            nx, ny = self.snap(mx - self._drag_offset[0], my - self._drag_offset[1])
+            dx, dy = nx - pn.x, ny - pn.y
+            if not (dx or dy):
+                return
+            for nid in self._multi_select:
+                if nid not in self.model.nodes:
+                    continue
+                n = self.model.nodes[nid]
+                n.x += dx
+                n.y += dy
+                self.canvas.move(f"node:{nid}",
+                                 dx * self._zoom, dy * self._zoom)
+            self.canvas.delete("edge")
+            self._edge_by_item.clear()
+            for e in self.model.edges:
+                self.draw_edge(e)
+            if self._active_lane_id and self._active_lane_id in self.model.nodes:
+                self._draw_lane_handles(self.model.nodes[self._active_lane_id])
+            self._update_scrollregion()
+            self._stack_layers()
+            self._draw_selection_overlays()
+            self._changed_during_drag = True
+            return
+
+        # Single node dragging
         if not self._selected_item or self._selected_type != "node":
             return
-        nid = self.item_to_node_id(self._selected_item)
-        if not nid and self._selected_item in self._label_by_item:
-            nid, _ = self._label_by_item[self._selected_item]
+        nid = self._resolve_node_id_from_item(self._selected_item)
         if not nid or nid not in self.model.nodes:
             return
         n = self.model.nodes[nid]
-        nx, ny = self.snap(cx - self._drag_offset[0], cy - self._drag_offset[1])
+        nx, ny = self.snap(mx - self._drag_offset[0], my - self._drag_offset[1])
         dx, dy = nx - n.x, ny - n.y
         if not (dx or dy):
             return
         n.x, n.y = nx, ny
-        self.canvas.move(f"node:{nid}", dx, dy)
+        self.canvas.move(f"node:{nid}", dx * self._zoom, dy * self._zoom)
         # Redraw edges
         self.canvas.delete("edge")
         self._edge_by_item.clear()
@@ -967,9 +1554,33 @@ class BPMNStudio(tk.Tk):
             self._draw_lane_handles(self.model.nodes[self._active_lane_id])
         self._update_scrollregion()
         self._stack_layers()
+        self._draw_selection_overlays()
         self._changed_during_drag = True
 
     def on_release(self, event):
+        # Finish rubber-band selection
+        if self._rubber_band_start is not None:
+            cx, cy = self._event_xy_canvas(event)
+            rbx, rby = self._rubber_band_start
+            # Convert to model coords
+            x1m = self._cm(min(rbx, cx))
+            y1m = self._cm(min(rby, cy))
+            x2m = self._cm(max(rbx, cx))
+            y2m = self._cm(max(rby, cy))
+            # Find nodes whose bbox intersects the rubber-band
+            for nid, n in self.model.nodes.items():
+                if n.type in ("lane", "pool"):
+                    continue
+                nx1, ny1, nx2, ny2 = n.x, n.y, n.x + n.w, n.y + n.h
+                if nx2 > x1m and nx1 < x2m and ny2 > y1m and ny1 < y2m:
+                    self._multi_select.add(nid)
+            if self._rubber_band_item:
+                self.canvas.delete(self._rubber_band_item)
+                self._rubber_band_item = None
+            self._rubber_band_start = None
+            self._draw_selection_overlays()
+            return
+
         if self._resizing_lane:
             self._resizing_lane = None
             self._stack_layers()
@@ -990,6 +1601,8 @@ class BPMNStudio(tk.Tk):
             self._push_history("move node")
             self._changed_during_drag = False
 
+        self._primary_drag_nid = None
+
     def on_double_click(self, event):
         if self.view_mode != "bpmn":
             return
@@ -999,9 +1612,7 @@ class BPMNStudio(tk.Tk):
             return
         kind = self.get_item_kind(item)
         if kind in ("node", "lane", "pool"):
-            nid = self.item_to_node_id(item)
-            if not nid and item in self._label_by_item:
-                nid, _ = self._label_by_item[item]
+            nid = self._resolve_node_id_from_item(item)
             if nid and nid in self.model.nodes:
                 n = self.model.nodes[nid]
                 new = simpledialog.askstring(
@@ -1012,9 +1623,7 @@ class BPMNStudio(tk.Tk):
                     self.redraw_all()
                     self._push_history("rename")
         elif kind == "edge":
-            eid = self.item_to_edge_id(item)
-            if not eid and item in self._label_by_item:
-                eid, _ = self._label_by_item[item]
+            eid = self._resolve_edge_id_from_item(item)
             if eid:
                 e = next((x for x in self.model.edges if x.id == eid), None)
                 if e is not None:
@@ -1029,14 +1638,25 @@ class BPMNStudio(tk.Tk):
     def on_delete(self, event):
         if self.view_mode != "bpmn":
             return
+        # Multi-select delete
+        if self._multi_select:
+            for nid in list(self._multi_select):
+                if nid == self._active_lane_id:
+                    self._active_lane_id = None
+                    self._clear_lane_handles()
+                self.model.delete_node(nid)
+            self._multi_select.clear()
+            self._selected_item = None
+            self.redraw_all()
+            self._push_history("delete")
+            return
+
         if not self._selected_item:
             self._flash_message("Nothing selected to delete")
             return
         kind = self.get_item_kind(self._selected_item)
         if kind in ("node", "lane", "pool"):
-            nid = self.item_to_node_id(self._selected_item)
-            if not nid and self._selected_item in self._label_by_item:
-                nid, _ = self._label_by_item[self._selected_item]
+            nid = self._resolve_node_id_from_item(self._selected_item)
             if nid:
                 if nid == self._active_lane_id:
                     self._active_lane_id = None
@@ -1046,9 +1666,7 @@ class BPMNStudio(tk.Tk):
                 self.redraw_all()
                 self._push_history("delete")
         elif kind == "edge":
-            eid = self.item_to_edge_id(self._selected_item)
-            if not eid and self._selected_item in self._label_by_item:
-                eid, _ = self._label_by_item[self._selected_item]
+            eid = self._resolve_edge_id_from_item(self._selected_item)
             if eid:
                 self.model.delete_edge(eid)
                 self._selected_item = None
@@ -1093,6 +1711,16 @@ class BPMNStudio(tk.Tk):
             self._clear_lane_handles()
         else:
             return
+
+        # Show/hide colour menu only for non-edge items
+        try:
+            if kind == "edge":
+                self._ctx_menu.entryconfig("Change Colour…", state="disabled")
+            else:
+                self._ctx_menu.entryconfig("Change Colour…", state="normal")
+        except Exception:
+            pass
+
         try:
             self._ctx_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1122,9 +1750,7 @@ class BPMNStudio(tk.Tk):
             return
         items_to_move = []
         if kind in ("lane", "pool", "node"):
-            nid = self.item_to_node_id(self._selected_item)
-            if not nid and self._selected_item in self._label_by_item:
-                nid, _ = self._label_by_item[self._selected_item]
+            nid = self._resolve_node_id_from_item(self._selected_item)
             if not nid or nid not in self.model.nodes:
                 return
             obj = self.model.nodes[nid]
@@ -1136,9 +1762,7 @@ class BPMNStudio(tk.Tk):
                 tag = f"node:{nid}"
             items_to_move = list(self.canvas.find_withtag(tag))
         elif kind == "edge":
-            eid = self.item_to_edge_id(self._selected_item)
-            if not eid and self._selected_item in self._label_by_item:
-                eid, _ = self._label_by_item[self._selected_item]
+            eid = self._resolve_edge_id_from_item(self._selected_item)
             if not eid:
                 return
             for it, mapped in list(self._edge_by_item.items()):
@@ -1153,6 +1777,220 @@ class BPMNStudio(tk.Tk):
             except Exception:
                 pass
         self._stack_layers()
+
+    # -------- Colour picking via context menu
+    def _pick_colour(self, attr):
+        """Pick a colour for the selected node's attribute ('fill', 'outline', 'text_color')."""
+        if not self._selected_item:
+            return
+        nid = self._resolve_node_id_from_item(self._selected_item)
+        if not nid or nid not in self.model.nodes:
+            return
+        node = self.model.nodes[nid]
+        cur = getattr(node, attr, None) or "#ffffff"
+        label_map = {"fill": "Fill Colour", "outline": "Outline Colour", "text_color": "Text Colour"}
+        result = colorchooser.askcolor(color=cur, parent=self,
+                                       title=f"Choose {label_map.get(attr, attr)}")
+        if result and result[1]:
+            setattr(node, attr, result[1])
+            self.redraw_all()
+            self._push_history(f"change colour {attr}")
+
+    # -------- Copy/Paste
+    def cmd_copy(self):
+        """Copy selected nodes to clipboard."""
+        if self.view_mode != "bpmn":
+            return
+        nids_to_copy = set()
+        if self._multi_select:
+            nids_to_copy = set(self._multi_select)
+        elif self._selected_item:
+            nid = self._resolve_node_id_from_item(self._selected_item)
+            if nid and nid in self.model.nodes:
+                nids_to_copy.add(nid)
+        if not nids_to_copy:
+            self._flash_message("Nothing to copy")
+            return
+        self._clipboard = []
+        for nid in nids_to_copy:
+            n = self.model.nodes[nid]
+            self._clipboard.append(copy.deepcopy(n.to_dict()))
+        self._flash_message(f"Copied {len(self._clipboard)} node(s)")
+
+    def cmd_paste(self):
+        """Paste clipboard nodes with offset."""
+        if self.view_mode != "bpmn":
+            return
+        if not self._clipboard:
+            self._flash_message("Clipboard is empty")
+            return
+        self._multi_select.clear()
+        offset = 30
+        for nd in self._clipboard:
+            ntype = nd.get("type", "task")
+            x = (nd.get("x") or 0) + offset
+            y = (nd.get("y") or 0) + offset
+            w = nd.get("w", 120)
+            h = nd.get("h", 60)
+            text = nd.get("name", ntype)
+            style = nd.get("style", {}) or {}
+            new_node = self.model.add_node_with_id(
+                self.model.gen_id(_TYPE_PREFIX.get(ntype, ntype)),
+                ntype, x, y, w, h, text,
+                fill=style.get("fill"), outline=style.get("outline"),
+                text_color=style.get("text"),
+            )
+            self._multi_select.add(new_node.id)
+        self.redraw_all()
+        self._push_history("paste")
+        self._flash_message(f"Pasted {len(self._clipboard)} node(s)")
+
+    def cmd_select_all(self):
+        """Select all non-lane/pool nodes."""
+        if self.view_mode != "bpmn":
+            return
+        self._multi_select.clear()
+        for nid, n in self.model.nodes.items():
+            if n.type not in ("lane", "pool"):
+                self._multi_select.add(nid)
+        self._draw_selection_overlays()
+
+    # -------- Auto-layout
+    def auto_layout(self):
+        """Layered left-to-right layout of process nodes."""
+        process_nodes = {nid: n for nid, n in self.model.nodes.items()
+                         if n.type not in ("lane", "pool")}
+        if not process_nodes:
+            self._flash_message("No process nodes to lay out.")
+            return
+
+        # Build successor/predecessor maps from sequence flows
+        successors = {nid: [] for nid in process_nodes}
+        predecessors = {nid: [] for nid in process_nodes}
+        for e in self.model.edges:
+            if e.type == "sequenceFlow" and e.src in process_nodes and e.tgt in process_nodes:
+                successors[e.src].append(e.tgt)
+                predecessors[e.tgt].append(e.src)
+
+        # BFS from start nodes (no incoming flows)
+        start_nodes = [nid for nid in process_nodes if not predecessors[nid]]
+        if not start_nodes:
+            # Cycle: pick node with fewest predecessors
+            start_nodes = [min(process_nodes.keys(),
+                               key=lambda nid: len(predecessors[nid]))]
+
+        layers = {}
+        visited = set()
+        queue = list(start_nodes)
+        for nid in queue:
+            layers[nid] = 0
+            visited.add(nid)
+
+        i = 0
+        while i < len(queue):
+            nid = queue[i]
+            i += 1
+            for succ in successors[nid]:
+                if succ not in visited:
+                    layers[succ] = layers[nid] + 1
+                    visited.add(succ)
+                    queue.append(succ)
+                else:
+                    layers[succ] = max(layers.get(succ, 0), layers[nid] + 1)
+
+        # Assign remaining unvisited nodes
+        for nid in process_nodes:
+            if nid not in layers:
+                layers[nid] = 0
+
+        # Group by layer
+        layer_groups = {}
+        for nid, layer in layers.items():
+            layer_groups.setdefault(layer, []).append(nid)
+
+        START_X = 80
+        H_GAP = 60
+        V_GAP = 40
+        max_w = max((process_nodes[nid].w for nid in process_nodes), default=160)
+        max_h = max((process_nodes[nid].h for nid in process_nodes), default=80)
+        centre_y = 300
+
+        for layer, nids in sorted(layer_groups.items()):
+            total_h = len(nids) * max_h + (len(nids) - 1) * V_GAP
+            start_y = centre_y - total_h / 2
+            x = START_X + layer * (max_w + H_GAP)
+            for idx, nid in enumerate(nids):
+                n = process_nodes[nid]
+                n.x = x
+                n.y = start_y + idx * (max_h + V_GAP)
+
+        self._push_history("auto layout")
+        self.redraw_all()
+        self._flash_message("Auto layout applied.")
+
+    # -------- Diagram Validation
+    def validate_diagram(self):
+        """Validate the diagram and report errors and warnings."""
+        errors = []
+        warnings = []
+        nodes = self.model.nodes
+        edges = self.model.edges
+
+        # Check for startEvent
+        has_start = any(n.type == "startEvent" for n in nodes.values())
+        if not has_start:
+            errors.append("ERROR: No startEvent found in the diagram.")
+
+        # Check for endEvent
+        has_end = any(n.type == "endEvent" for n in nodes.values())
+        if not has_end:
+            errors.append("ERROR: No endEvent found in the diagram.")
+
+        # Check edges reference valid nodes
+        for e in edges:
+            if e.src not in nodes:
+                errors.append(f"ERROR: Edge '{e.id}' references missing source node '{e.src}'.")
+            if e.tgt not in nodes:
+                errors.append(f"ERROR: Edge '{e.id}' references missing target node '{e.tgt}'.")
+
+        # Check isolated nodes
+        connected = set()
+        for e in edges:
+            connected.add(e.src)
+            connected.add(e.tgt)
+        for nid, n in nodes.items():
+            if n.type in ("lane", "pool"):
+                continue
+            if nid not in connected:
+                warnings.append(f"WARNING: Node '{n.text}' ({nid}) has no connections (isolated).")
+
+        # Check gateways with < 2 outgoing sequence flows
+        gateway_types = ("exclusiveGateway", "parallelGateway", "inclusiveGateway")
+        for nid, n in nodes.items():
+            if n.type in gateway_types:
+                out_flows = [e for e in edges
+                             if e.type == "sequenceFlow" and e.src == nid]
+                if len(out_flows) < 2:
+                    warnings.append(
+                        f"WARNING: Gateway '{n.text}' ({nid}) has fewer than 2 outgoing "
+                        f"sequence flows ({len(out_flows)} found)."
+                    )
+
+        if not errors and not warnings:
+            messagebox.showinfo("Validation", "No issues found. Diagram looks valid!")
+            return
+
+        lines = []
+        if errors:
+            lines.append("ERRORS:")
+            lines.extend(errors)
+        if warnings:
+            if lines:
+                lines.append("")
+            lines.append("WARNINGS:")
+            lines.extend(warnings)
+
+        messagebox.showwarning("Validation Results", "\n".join(lines))
 
     # -------- View toggles
     def toggle_view_bpmn(self):
@@ -1171,8 +2009,10 @@ class BPMNStudio(tk.Tk):
                     return
         self.json_frame.pack_forget()
         self.toolbar.pack(side=tk.LEFT, fill=tk.Y)
-        self.canvas.pack(side=tk.TOP, expand=True, fill=tk.BOTH)
+        self.canvas_area.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+        self.prop_panel.pack(side=tk.RIGHT, fill=tk.Y)
         self.view_mode = "bpmn"
+        self._multi_select.clear()
         self.redraw_all()
         self._update_window_title()
 
@@ -1182,10 +2022,12 @@ class BPMNStudio(tk.Tk):
             data["file"] = os.path.basename(self.current_file)
         self.json_text.delete("1.0", tk.END)
         self.json_text.insert("1.0", json.dumps(data, indent=2, ensure_ascii=False))
-        self.canvas.pack_forget()
+        self.canvas_area.pack_forget()
         self.toolbar.pack_forget()
+        self.prop_panel.pack_forget()
         self.json_frame.pack(expand=True, fill=tk.BOTH)
         self.view_mode = "json"
+        self._multi_select.clear()
         self._update_window_title()
 
     # -------- File ops (JSON)
@@ -1197,6 +2039,7 @@ class BPMNStudio(tk.Tk):
         self._active_lane_id = None
         self._clear_lane_handles()
         self._dirty = False
+        self._multi_select.clear()
         if self.view_mode == "bpmn":
             self.redraw_all()
         else:
@@ -1260,6 +2103,7 @@ class BPMNStudio(tk.Tk):
             self._active_lane_id = None
             self._clear_lane_handles()
             self._dirty = False
+            self._multi_select.clear()
             if self.view_mode == "bpmn":
                 self.redraw_all()
             else:
@@ -1283,6 +2127,7 @@ class BPMNStudio(tk.Tk):
             self._active_lane_id = None
             self._clear_lane_handles()
             self._dirty = False
+            self._multi_select.clear()
             if self.view_mode == "bpmn":
                 self.redraw_all()
             else:
@@ -1308,7 +2153,9 @@ class BPMNStudio(tk.Tk):
             xml_string = self._model_to_bpmn_xml()
             with open(path, "w", encoding="utf-8") as f:
                 f.write(xml_string)
-            self._flash_message(f"Exported BPMN XML: {path}  (Note: colours are only saved in JSON.)")
+            self._flash_message(
+                f"Exported BPMN XML: {path}  (Note: colours are only saved in JSON.)"
+            )
         except Exception as e:
             messagebox.showerror("BPMN Export Error", f"Failed to export BPMN: {e}")
 
@@ -1377,11 +2224,15 @@ class BPMNStudio(tk.Tk):
                 for lane in findall(laneset, "lane"):
                     add_lane_recursive(lane, pid_map)
 
-            # Maps BPMN XML tag → internal type; original tag is preserved as subtype for tasks.
+            # Maps BPMN XML tag -> internal type
             node_tags = [
                 ("startEvent", "startEvent"),
                 ("endEvent", "endEvent"),
                 ("exclusiveGateway", "exclusiveGateway"),
+                ("parallelGateway", "parallelGateway"),
+                ("inclusiveGateway", "inclusiveGateway"),
+                ("intermediateCatchEvent", "intermediateEvent"),
+                ("intermediateThrowEvent", "intermediateEvent"),
                 ("task", "task"),
                 ("userTask", "task"),
                 ("serviceTask", "task"),
@@ -1397,9 +2248,9 @@ class BPMNStudio(tk.Tk):
                     nid_orig = el.attrib.get("id")
                     nname = el.attrib.get("name", ntype)
                     x, y, w, h = bounds_by_id.get(nid_orig, (200.0, 100.0, 160.0, 80.0))
-                    if ntype in ("startEvent", "endEvent") and nid_orig not in bounds_by_id:
+                    if ntype in ("startEvent", "endEvent", "intermediateEvent") and nid_orig not in bounds_by_id:
                         w = h = 60.0
-                    if ntype == "exclusiveGateway" and nid_orig not in bounds_by_id:
+                    if ntype in ("exclusiveGateway", "parallelGateway", "inclusiveGateway") and nid_orig not in bounds_by_id:
                         w = h = 80.0
                     nid = ensure_unique_id(nid_orig, pid_map.values())
                     if nid != nid_orig:
@@ -1494,8 +2345,13 @@ class BPMNStudio(tk.Tk):
                 el = E("endEvent", id=node.id, name=name_attr)
             elif node.type == "exclusiveGateway":
                 el = E("exclusiveGateway", id=node.id, name=name_attr)
+            elif node.type == "parallelGateway":
+                el = E("parallelGateway", id=node.id, name=name_attr)
+            elif node.type == "inclusiveGateway":
+                el = E("inclusiveGateway", id=node.id, name=name_attr)
+            elif node.type == "intermediateEvent":
+                el = E("intermediateCatchEvent", id=node.id, name=name_attr)
             elif node.type == "task":
-                # Use original subtype if available, otherwise default to userTask
                 task_tag = node.subtype if node.subtype else "userTask"
                 el = E(task_tag, id=node.id, name=name_attr)
             else:
@@ -1557,12 +2413,13 @@ class BPMNStudio(tk.Tk):
                 continue
             s = self.model.nodes[e.src]
             t = self.model.nodes[e.tgt]
-            x1, y1 = self.center_of_node(s)
-            x2, y2 = self.center_of_node(t)
-            edge = E("BPMNEdge", "bpmndi", id=f"{e.id}_di", bpmnElement=e.id)
-            plane.append(edge)
-            ET.SubElement(edge, self.q("waypoint", "di"), {"x": str(x1), "y": str(y1)})
-            ET.SubElement(edge, self.q("waypoint", "di"), {"x": str(x2), "y": str(y2)})
+            # Use orthogonal waypoints for XML export (model coords)
+            model_pts = self._edge_waypoints(s, t)
+            edge_el = E("BPMNEdge", "bpmndi", id=f"{e.id}_di", bpmnElement=e.id)
+            plane.append(edge_el)
+            for idx in range(0, len(model_pts), 2):
+                ET.SubElement(edge_el, self.q("waypoint", "di"),
+                              {"x": str(model_pts[idx]), "y": str(model_pts[idx + 1])})
 
         xml_bytes = ET.tostring(defs, encoding="utf-8", xml_declaration=True)
         return xml_bytes.decode("utf-8")
@@ -1581,7 +2438,7 @@ class BPMNStudio(tk.Tk):
             if was_json:
                 self.json_frame.pack_forget()
                 self.toolbar.pack(side=tk.LEFT, fill=tk.Y)
-                self.canvas.pack(side=tk.TOP, expand=True, fill=tk.BOTH)
+                self.canvas_area.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
                 self.view_mode = "bpmn"
                 self.redraw_all()
             self.update_idletasks()
@@ -1627,6 +2484,7 @@ class BPMNStudio(tk.Tk):
 
     def _load_snapshot(self, snap):
         self.model.load_json(snap)
+        self._multi_select.clear()
         if self.view_mode == "bpmn":
             self.redraw_all()
         else:

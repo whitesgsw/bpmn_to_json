@@ -1,0 +1,205 @@
+{
+  "definitions_id": "Defs_1",
+  "processes": [
+    {
+      "id": "Process_1",
+      "name": "Process_1",
+      "nodes": {
+        "StartEvent_1": {
+          "id": "StartEvent_1",
+          "type": "startEvent",
+          "subtype": null,
+          "name": "Start",
+          "x": 60,
+          "y": 230,
+          "w": 60,
+          "h": 60,
+          "lane": null,
+          "incoming": [],
+          "outgoing": [
+            "Flow_6"
+          ],
+          "next": [
+            "Task_2"
+          ],
+          "prev": [],
+          "style": {
+            "fill": "#ffffff",
+            "outline": "#3b82f6",
+            "text": "#111827"
+          }
+        },
+        "Task_2": {
+          "id": "Task_2",
+          "type": "task",
+          "subtype": null,
+          "name": "Task",
+          "x": 180,
+          "y": 220,
+          "w": 160,
+          "h": 80,
+          "lane": null,
+          "incoming": [
+            "Flow_6"
+          ],
+          "outgoing": [
+            "Flow_7"
+          ],
+          "next": [
+            "Task_3"
+          ],
+          "prev": [
+            "StartEvent_1"
+          ],
+          "style": {
+            "fill": "#ffffff",
+            "outline": "#374151",
+            "text": "#111827"
+          }
+        },
+        "Task_3": {
+          "id": "Task_3",
+          "type": "task",
+          "subtype": null,
+          "name": "Task",
+          "x": 430,
+          "y": 220,
+          "w": 160,
+          "h": 80,
+          "lane": null,
+          "incoming": [
+            "Flow_7"
+          ],
+          "outgoing": [
+            "Flow_8"
+          ],
+          "next": [
+            "Task_4"
+          ],
+          "prev": [
+            "Task_2"
+          ],
+          "style": {
+            "fill": "#ffffff",
+            "outline": "#374151",
+            "text": "#111827"
+          }
+        },
+        "Task_4": {
+          "id": "Task_4",
+          "type": "task",
+          "subtype": null,
+          "name": "Task",
+          "x": 700,
+          "y": 220,
+          "w": 160,
+          "h": 80,
+          "lane": null,
+          "incoming": [
+            "Flow_8"
+          ],
+          "outgoing": [
+            "Flow_9"
+          ],
+          "next": [
+            "EndEvent_5"
+          ],
+          "prev": [
+            "Task_3"
+          ],
+          "style": {
+            "fill": "#ffffff",
+            "outline": "#374151",
+            "text": "#111827"
+          }
+        },
+        "EndEvent_5": {
+          "id": "EndEvent_5",
+          "type": "endEvent",
+          "subtype": null,
+          "name": "End",
+          "x": 900,
+          "y": 230,
+          "w": 60,
+          "h": 60,
+          "lane": null,
+          "incoming": [
+            "Flow_9"
+          ],
+          "outgoing": [],
+          "next": [],
+          "prev": [
+            "Task_4"
+          ],
+          "style": {
+            "fill": "#ffffff",
+            "outline": "#ef4444",
+            "text": "#111827"
+          }
+        },
+        "Lane_11": {
+          "id": "Lane_11",
+          "type": "lane",
+          "subtype": null,
+          "name": "SwimLaneTest",
+          "x": 50,
+          "y": 150,
+          "w": 944.0,
+          "h": 200.0,
+          "lane": null,
+          "incoming": [],
+          "outgoing": [],
+          "next": [],
+          "prev": [],
+          "style": {
+            "fill": "#f9fbff",
+            "outline": "#b9c6d3",
+            "text": "#111827"
+          }
+        }
+      },
+      "edges": [
+        {
+          "id": "Flow_6",
+          "type": "sequenceFlow",
+          "from": "StartEvent_1",
+          "to": "Task_2",
+          "name": "",
+          "condition": null
+        },
+        {
+          "id": "Flow_7",
+          "type": "sequenceFlow",
+          "from": "Task_2",
+          "to": "Task_3",
+          "name": "",
+          "condition": null
+        },
+        {
+          "id": "Flow_8",
+          "type": "sequenceFlow",
+          "from": "Task_3",
+          "to": "Task_4",
+          "name": "",
+          "condition": null
+        },
+        {
+          "id": "Flow_9",
+          "type": "sequenceFlow",
+          "from": "Task_4",
+          "to": "EndEvent_5",
+          "name": "",
+          "condition": null
+        }
+      ],
+      "di": {
+        "shapes": {},
+        "edges": {}
+      }
+    }
+  ],
+  "collaboration": {
+    "messageFlows": []
+  },
+  "file": "test.json"
+}
