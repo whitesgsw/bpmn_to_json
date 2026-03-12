@@ -88,6 +88,14 @@ class Node:
             self.fill = self.fill or "#ffffff"
             self.outline = self.outline or "#f59e0b"
             self.text_color = self.text_color or "#111827"
+        elif self.type == "annotation":
+            self.fill = self.fill or "#fffde7"
+            self.outline = self.outline or "#fbbf24"
+            self.text_color = self.text_color or "#374151"
+        elif self.type == "externalPool":
+            self.fill = self.fill or "#f3f4f6"
+            self.outline = self.outline or "#9ca3af"
+            self.text_color = self.text_color or "#6b7280"
         else:
             self.fill = self.fill or "#ffffff"
             self.outline = self.outline or "#111827"
@@ -143,15 +151,50 @@ _TYPE_PREFIX = {
     "intermediateEvent": "IntermediateEvent",
     "lane": "Lane",
     "pool": "Pool",
+    "annotation": "Annotation",
+    "externalPool": "ExtPool",
 }
+
+_CONFIG_FILE = os.path.expanduser("~/.bpmn_studio_config.json")
 
 
 class BPMNModel:
     def __init__(self, process_name="Process_1"):
-        self.process_name = process_name
-        self.nodes = {}
-        self.edges = []
+        self.processes = [{"id": "Process_1", "name": process_name, "nodes": {}, "edges": []}]
+        self.active_process_idx = 0
+        self.links = []
         self._counter = 1
+
+    @property
+    def process_name(self):
+        return self.processes[self.active_process_idx]["name"]
+
+    @process_name.setter
+    def process_name(self, value):
+        self.processes[self.active_process_idx]["name"] = value
+
+    @property
+    def nodes(self):
+        return self.processes[self.active_process_idx]["nodes"]
+
+    @property
+    def edges(self):
+        return self.processes[self.active_process_idx]["edges"]
+
+    def add_process(self, name=None):
+        idx = len(self.processes) + 1
+        pid = f"Process_{idx}"
+        name = name or f"Process {idx}"
+        self.processes.append({"id": pid, "name": name, "nodes": {}, "edges": []})
+        return len(self.processes) - 1
+
+    def delete_process(self, idx):
+        if len(self.processes) <= 1:
+            return False
+        self.processes.pop(idx)
+        if self.active_process_idx >= len(self.processes):
+            self.active_process_idx = len(self.processes) - 1
+        return True
 
     def gen_id(self, prefix):
         nid = f"{prefix}_{self._counter}"
@@ -183,6 +226,9 @@ class BPMNModel:
         elif ntype == "pool":
             w, h = 1100, 220
             text = "Pool"
+        elif ntype == "annotation":
+            w, h = 160, 60
+            text = "Note"
         else:
             w, h = 160, 80
             text = "Task"
@@ -253,53 +299,63 @@ class BPMNModel:
     def to_json(self):
         return {
             "definitions_id": "Defs_1",
-            "processes": [{
-                "id": "Process_1",
-                "name": self.process_name,
-                "nodes": {nid: n.to_dict() for nid, n in self.nodes.items()},
-                "edges": [e.to_dict() for e in self.edges],
-                "di": {"shapes": {}, "edges": {}},
-            }],
+            "processes": [
+                {
+                    "id": p.get("id", f"Process_{i+1}"),
+                    "name": p.get("name", f"Process {i+1}"),
+                    "nodes": {nid: n.to_dict() for nid, n in p["nodes"].items()},
+                    "edges": [e.to_dict() for e in p["edges"]],
+                    "di": {"shapes": {}, "edges": {}},
+                }
+                for i, p in enumerate(self.processes)
+            ],
+            "links": self.links,
             "collaboration": {"messageFlows": []},
         }
 
     def load_json(self, data):
-        self.nodes.clear()
-        self.edges.clear()
+        self.processes = []
+        self.active_process_idx = 0
+        self.links = data.get("links", [])
         self._counter = 1
         procs = data.get("processes", [])
         if not procs:
+            self.processes = [{"id": "Process_1", "name": "Process 1", "nodes": {}, "edges": []}]
             return
-        p = procs[0]
-        self.process_name = p.get("name") or "Process_1"
-        for nid, nd in p.get("nodes", {}).items():
-            style = nd.get("style", {}) or {}
-            node = Node(
-                nid, nd.get("type"), nd.get("x"), nd.get("y"),
-                nd.get("w", 120), nd.get("h", 60),
-                text=(nd.get("name") or nd.get("type") or "Node"),
-                lane_id=nd.get("lane"),
-                fill=style.get("fill"), outline=style.get("outline"), text_color=style.get("text"),
-            )
-            node.subtype = nd.get("subtype")
-            node.ensure_defaults_for_type()
-            node.incoming = [str(x) for x in (nd.get("incoming", []) or []) if x is not None]
-            node.outgoing = [str(x) for x in (nd.get("outgoing", []) or []) if x is not None]
-            node.next = [str(x) for x in (nd.get("next", []) or []) if x is not None]
-            node.prev = [str(x) for x in (nd.get("prev", []) or []) if x is not None]
-            self.nodes[nid] = node
-        for ed in p.get("edges", []):
-            e = Edge(ed.get("id"), ed.get("from"), ed.get("to"), ed.get("name"),
-                     etype=ed.get("type", "sequenceFlow"))
-            e.condition = ed.get("condition")
-            self.edges.append(e)
-        # Set counter above the highest numeric suffix in all existing IDs to prevent collisions.
         max_num = 0
-        all_ids = list(self.nodes.keys()) + [e.id for e in self.edges if e.id]
-        for id_str in all_ids:
-            parts = id_str.rsplit("_", 1)
-            if len(parts) == 2 and parts[1].isdigit():
-                max_num = max(max_num, int(parts[1]))
+        for p in procs:
+            proc = {"id": p.get("id", "Process_1"), "name": p.get("name", "Process 1"),
+                    "nodes": {}, "edges": []}
+            for nid, nd in p.get("nodes", {}).items():
+                style = nd.get("style", {}) or {}
+                node = Node(
+                    nid, nd.get("type"), nd.get("x"), nd.get("y"),
+                    nd.get("w", 120), nd.get("h", 60),
+                    text=(nd.get("name") or nd.get("type") or "Node"),
+                    lane_id=nd.get("lane"),
+                    fill=style.get("fill"), outline=style.get("outline"),
+                    text_color=style.get("text"),
+                )
+                node.subtype = nd.get("subtype")
+                node.ensure_defaults_for_type()
+                node.incoming = [str(x) for x in (nd.get("incoming", []) or []) if x is not None]
+                node.outgoing = [str(x) for x in (nd.get("outgoing", []) or []) if x is not None]
+                node.next = [str(x) for x in (nd.get("next", []) or []) if x is not None]
+                node.prev = [str(x) for x in (nd.get("prev", []) or []) if x is not None]
+                proc["nodes"][nid] = node
+                parts = nid.rsplit("_", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    max_num = max(max_num, int(parts[1]))
+            for ed in p.get("edges", []):
+                e = Edge(ed.get("id"), ed.get("from"), ed.get("to"), ed.get("name"),
+                         etype=ed.get("type", "sequenceFlow"))
+                e.condition = ed.get("condition")
+                proc["edges"].append(e)
+                if e.id:
+                    parts = e.id.rsplit("_", 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        max_num = max(max_num, int(parts[1]))
+            self.processes.append(proc)
         self._counter = max_num + 1
 
 
@@ -348,6 +404,7 @@ class BPMNStudio(tk.Tk):
         self._lane_handle_to_info = {}
         self._resizing_lane = None
         self._dragging_lane = None
+        self._panning = False
 
         # Multi-select state
         self._multi_select = set()
@@ -371,6 +428,13 @@ class BPMNStudio(tk.Tk):
 
         # Grid debounce
         self._grid_after_id = None
+
+        # Recent files
+        self._recent_files = []
+        self._recent_menu = None
+
+        # Minimap
+        self._minimap_visible = tk.BooleanVar(value=True)
 
         # Build UI
         self._build_menu()
@@ -398,6 +462,7 @@ class BPMNStudio(tk.Tk):
         self._colour_menu.add_command(label="Text Colour…",
                                       command=lambda: self._pick_colour("text_color"))
         self._ctx_menu.add_cascade(label="Change Colour…", menu=self._colour_menu)
+        self._ctx_menu.add_command(label="Remove Link", command=self._ctx_remove_link)
         self.canvas.bind("<Button-3>", self.on_right_click)
         self.canvas.bind("<Control-Button-1>", self.on_right_click)  # macOS Ctrl+Click
 
@@ -409,9 +474,12 @@ class BPMNStudio(tk.Tk):
         self.bind_all("<Control-c>", lambda e: self.cmd_copy())
         self.bind_all("<Control-v>", lambda e: self.cmd_paste())
         self.bind_all("<Control-a>", lambda e: self.cmd_select_all())
+        self.bind_all("<Control-f>", lambda e: self._show_search())
 
         self._update_window_title()
         self._push_history("init")
+        self._load_recent_files()
+        self._update_process_tabs()
 
     # -------- Zoom helpers
     def _mc(self, v):
@@ -441,11 +509,15 @@ class BPMNStudio(tk.Tk):
         fm.add_command(label="New", command=self.new_diagram)
         fm.add_command(label="Open JSON…", command=self.open_json)
         fm.add_command(label="Open BPMN XML…", command=self.open_bpmn)
+        self._recent_menu = tk.Menu(fm, tearoff=0)
+        fm.add_cascade(label="Recent Files", menu=self._recent_menu)
+        fm.add_separator()
         fm.add_command(label="Save", command=self.save_file)
         fm.add_command(label="Save As…", command=self.save_json_as)
         fm.add_separator()
         fm.add_command(label="Export BPMN XML…", command=self.export_bpmn)
         fm.add_command(label="Export PNG…", command=self.export_png)
+        fm.add_command(label="Link External Process…", command=self.link_external_process)
         fm.add_separator()
         fm.add_command(label="Exit", command=self.destroy)
         self.menubar.add_cascade(label="File", menu=fm)
@@ -454,6 +526,7 @@ class BPMNStudio(tk.Tk):
         em.add_command(label="Copy", command=self.cmd_copy)
         em.add_command(label="Paste", command=self.cmd_paste)
         em.add_command(label="Select All", command=self.cmd_select_all)
+        em.add_command(label="Find…", command=self._show_search)
         em.add_separator()
         em.add_command(label="Auto Layout", command=self.auto_layout)
         em.add_separator()
@@ -467,6 +540,8 @@ class BPMNStudio(tk.Tk):
         vm.add_command(label="Zoom In", command=self.zoom_in)
         vm.add_command(label="Zoom Out", command=self.zoom_out)
         vm.add_command(label="Reset Zoom", command=self.zoom_reset)
+        vm.add_checkbutton(label="Show Minimap", variable=self._minimap_visible,
+                           command=self._toggle_minimap)
         self.menubar.add_cascade(label="View", menu=vm)
         self.config(menu=self.menubar)
 
@@ -493,6 +568,8 @@ class BPMNStudio(tk.Tk):
         tk.Label(self.toolbar, text="Connect:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
         add_btn("Sequence Flow", "connector", "c")
         add_btn("Message Flow", "msgConnector", "f")
+        tk.Label(self.toolbar, text="Annotate:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
+        add_btn("Annotation", "annotation", "a")
 
         tk.Label(self.toolbar, text="Zoom:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
         zoom_frame = tk.Frame(self.toolbar, bg="#ffffff")
@@ -516,6 +593,355 @@ class BPMNStudio(tk.Tk):
     def _on_snap_toggle(self):
         self._snap_to_grid = self._snap_var.get()
 
+    # -------- Recent files
+    def _load_recent_files(self):
+        try:
+            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self._recent_files = cfg.get("recent_files", [])
+        except Exception:
+            self._recent_files = []
+        self._rebuild_recent_menu()
+
+    def _save_recent_files(self):
+        try:
+            cfg = {}
+            try:
+                with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+            cfg["recent_files"] = self._recent_files
+            with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
+    def _add_recent_file(self, path):
+        path = os.path.abspath(path)
+        if path in self._recent_files:
+            self._recent_files.remove(path)
+        self._recent_files.insert(0, path)
+        self._recent_files = self._recent_files[:8]
+        self._save_recent_files()
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self):
+        if self._recent_menu is None:
+            return
+        self._recent_menu.delete(0, tk.END)
+        if not self._recent_files:
+            self._recent_menu.add_command(label="(no recent files)", state=tk.DISABLED)
+            return
+        for path in self._recent_files:
+            label = os.path.basename(path)
+            if os.path.exists(path):
+                self._recent_menu.add_command(
+                    label=label,
+                    command=lambda p=path: self._open_recent(p),
+                )
+            else:
+                self._recent_menu.add_command(
+                    label=f"{label}  [missing]",
+                    state=tk.DISABLED,
+                )
+        self._recent_menu.add_separator()
+        self._recent_menu.add_command(label="Clear Recent Files",
+                                      command=self._clear_recent_files)
+
+    def _clear_recent_files(self):
+        self._recent_files = []
+        self._save_recent_files()
+        self._rebuild_recent_menu()
+
+    def _open_recent(self, path):
+        if path.lower().endswith(".json"):
+            self._do_open_json(path)
+        else:
+            self._flash_message(f"Cannot open: {path}")
+
+    # -------- Process tabs
+    def _update_process_tabs(self):
+        for w in self._tab_bar.winfo_children():
+            w.destroy()
+        for idx, proc in enumerate(self.model.processes):
+            active = (idx == self.model.active_process_idx)
+            bg = "#ffffff" if active else "#d1d5db"
+            btn = tk.Button(
+                self._tab_bar, text=proc["name"],
+                bg=bg, relief="flat", padx=10, pady=4,
+                command=lambda i=idx: self._switch_process(i),
+            )
+            btn.pack(side=tk.LEFT, padx=1, pady=2)
+            btn.bind("<Button-3>", lambda e, i=idx: self._tab_context_menu(e, i))
+        add_btn = tk.Button(self._tab_bar, text="+", bg="#e5e7eb", relief="flat",
+                            padx=8, pady=4, command=self._add_process)
+        add_btn.pack(side=tk.LEFT, padx=2, pady=2)
+
+    def _switch_process(self, idx):
+        self.model.active_process_idx = idx
+        self._active_lane_id = None
+        self._clear_lane_handles()
+        self._multi_select.clear()
+        self._selected_item = None
+        self.redraw_all()
+        self._update_process_tabs()
+
+    def _add_process(self):
+        name = simpledialog.askstring("New Process", "Process name:", parent=self)
+        if not name:
+            return
+        idx = self.model.add_process(name)
+        self._switch_process(idx)
+        self._push_history("add process")
+
+    def _tab_context_menu(self, event, idx):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Rename", command=lambda: self._rename_process(idx))
+        menu.add_command(label="Delete", command=lambda: self._delete_process(idx))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _rename_process(self, idx):
+        old = self.model.processes[idx]["name"]
+        new = simpledialog.askstring("Rename Process", "New name:", initialvalue=old, parent=self)
+        if new and new.strip():
+            self.model.processes[idx]["name"] = new.strip()
+            self._update_process_tabs()
+            self._push_history("rename process")
+
+    def _delete_process(self, idx):
+        if not messagebox.askyesno("Delete Process",
+                                   f"Delete process '{self.model.processes[idx]['name']}'?"):
+            return
+        if not self.model.delete_process(idx):
+            messagebox.showwarning("Cannot Delete", "Cannot delete the only process.")
+            return
+        self._switch_process(self.model.active_process_idx)
+        self._push_history("delete process")
+
+    # -------- Search / filter
+    def _show_search(self):
+        self._search_frame.pack(side=tk.TOP, fill=tk.X, before=self.canvas)
+        self._search_entry.focus_set()
+
+    def _hide_search(self):
+        self._search_frame.pack_forget()
+        self.canvas.delete("search_highlight")
+        self._search_matches = []
+        self._search_count_lbl.config(text="")
+
+    def _update_search_highlights(self):
+        self.canvas.delete("search_highlight")
+        self._search_matches = []
+        term = self._search_var.get().strip().lower()
+        if not term:
+            self._search_count_lbl.config(text="")
+            return
+        z = self._zoom
+        for nid, n in self.model.nodes.items():
+            if n.type in ("lane", "pool"):
+                continue
+            if term in (n.text or "").lower():
+                self._search_matches.append(nid)
+                pad = 4
+                self.canvas.create_rectangle(
+                    n.x * z - pad, n.y * z - pad,
+                    (n.x + n.w) * z + pad, (n.y + n.h) * z + pad,
+                    outline="#facc15", width=3, tags="search_highlight",
+                )
+        self.canvas.tag_raise("search_highlight")
+        self.canvas.tag_raise("node")
+        count = len(self._search_matches)
+        self._search_count_lbl.config(text=f"{count} match{'es' if count != 1 else ''}")
+        self._search_match_idx = 0
+
+    def _search_next(self):
+        if not self._search_matches:
+            return
+        self._search_match_idx = (self._search_match_idx + 1) % len(self._search_matches)
+        self._scroll_to_node(self._search_matches[self._search_match_idx])
+
+    def _search_prev(self):
+        if not self._search_matches:
+            return
+        self._search_match_idx = (self._search_match_idx - 1) % len(self._search_matches)
+        self._scroll_to_node(self._search_matches[self._search_match_idx])
+
+    def _scroll_to_node(self, nid):
+        if nid not in self.model.nodes:
+            return
+        n = self.model.nodes[nid]
+        z = self._zoom
+        cx = (n.x + n.w / 2) * z
+        cy = (n.y + n.h / 2) * z
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            return
+        x1, y1, x2, y2 = bbox
+        total_w = x2 - x1
+        total_h = y2 - y1
+        if total_w > 0:
+            self.canvas.xview_moveto((cx - x1 - 200) / total_w)
+        if total_h > 0:
+            self.canvas.yview_moveto((cy - y1 - 150) / total_h)
+
+    # -------- Minimap
+    def _toggle_minimap(self):
+        if self._minimap_visible.get():
+            self._minimap.place(relx=1.0, rely=1.0, anchor="se", x=-12, y=-12)
+        else:
+            self._minimap.place_forget()
+
+    def _refresh_minimap(self):
+        if not self._minimap_visible.get():
+            return
+        self._minimap.delete("all")
+        mw, mh = 160, 100
+        # Collect all node bounding boxes
+        nodes = [n for n in self.model.nodes.values() if n.type not in ("lane",)]
+        if not nodes:
+            return
+        min_x = min(n.x for n in nodes)
+        min_y = min(n.y for n in nodes)
+        max_x = max(n.x + n.w for n in nodes)
+        max_y = max(n.y + n.h for n in nodes)
+        span_x = max(max_x - min_x, 1)
+        span_y = max(max_y - min_y, 1)
+        pad = 10
+        scale_x = (mw - pad * 2) / span_x
+        scale_y = (mh - pad * 2) / span_y
+        scale = min(scale_x, scale_y)
+        def to_mm(nx, ny):
+            return (nx - min_x) * scale + pad, (ny - min_y) * scale + pad
+        for n in nodes:
+            mx1, my1 = to_mm(n.x, n.y)
+            mx2, my2 = to_mm(n.x + n.w, n.y + n.h)
+            self._minimap.create_rectangle(mx1, my1, mx2, my2,
+                                            fill=n.fill or "#ffffff",
+                                            outline=n.outline or "#374151", width=1)
+        # Viewport indicator
+        try:
+            x1f = self.canvas.xview()[0]
+            x2f = self.canvas.xview()[1]
+            y1f = self.canvas.yview()[0]
+            y2f = self.canvas.yview()[1]
+            bbox = self.canvas.bbox("all")
+            if bbox:
+                bx1, by1, bx2, by2 = bbox
+                tw = bx2 - bx1
+                th = by2 - by1
+                vx1 = (bx1 + x1f * tw - min_x * scale) + pad
+                vy1 = (by1 + y1f * th - min_y * scale) + pad
+                vx2 = (bx1 + x2f * tw - min_x * scale) + pad
+                vy2 = (by1 + y2f * th - min_y * scale) + pad
+                self._minimap.create_rectangle(vx1, vy1, vx2, vy2,
+                                                outline="#2563eb", width=1,
+                                                dash=(3, 2))
+        except Exception:
+            pass
+
+    def _minimap_click(self, event):
+        mw, mh = 160, 100
+        nodes = [n for n in self.model.nodes.values() if n.type not in ("lane",)]
+        if not nodes:
+            return
+        min_x = min(n.x for n in nodes)
+        min_y = min(n.y for n in nodes)
+        max_x = max(n.x + n.w for n in nodes)
+        max_y = max(n.y + n.h for n in nodes)
+        span_x = max(max_x - min_x, 1)
+        span_y = max(max_y - min_y, 1)
+        pad = 10
+        scale = min((mw - pad * 2) / span_x, (mh - pad * 2) / span_y)
+        model_x = (event.x - pad) / scale + min_x
+        model_y = (event.y - pad) / scale + min_y
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            return
+        bx1, by1, bx2, by2 = bbox
+        tw = max(bx2 - bx1, 1)
+        th = max(by2 - by1, 1)
+        canvas_x = model_x * self._zoom
+        canvas_y = model_y * self._zoom
+        self.canvas.xview_moveto(max(0, (canvas_x - bx1 - 200) / tw))
+        self.canvas.yview_moveto(max(0, (canvas_y - by1 - 150) / th))
+        self._refresh_minimap()
+
+    # -------- Cross-file process linking
+    def link_external_process(self):
+        path = filedialog.askopenfilename(
+            title="Select BPMN Studio JSON file to link",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            procs = data.get("processes", [])
+            if not procs:
+                messagebox.showwarning("Link External", "No processes found in selected file.")
+                return
+            for proc in procs:
+                pid = proc.get("id", "Process_1")
+                pname = proc.get("name", "Process")
+                nid = self.model.gen_id("ExtPool")
+                label = f"{os.path.basename(path)}: {pname}"
+                node = self.model.add_node_with_id(nid, "externalPool", 50, 50, 300, 80, label)
+                self.model.links.append({"file": path, "process": pid, "node_id": nid})
+            self.redraw_all()
+            self._update_process_tabs()
+            self._push_history("link external process")
+            self._flash_message(f"Linked: {os.path.basename(path)}")
+        except Exception as ex:
+            messagebox.showerror("Link Error", f"Failed to link file: {ex}")
+
+    def _ctx_remove_link(self):
+        if not self._selected_item:
+            return
+        nid = self.item_to_node_id(self._selected_item)
+        if not nid and self._selected_item in self._label_by_item:
+            nid, _ = self._label_by_item[self._selected_item]
+        if not nid or nid not in self.model.nodes:
+            return
+        if self.model.nodes[nid].type != "externalPool":
+            self._flash_message("Selected item is not an external link.")
+            return
+        self.model.links = [l for l in self.model.links if l.get("node_id") != nid]
+        self.model.delete_node(nid)
+        self._selected_item = None
+        self.redraw_all()
+        self._push_history("remove link")
+
+    def _load_external_links(self):
+        """Reload externalPool nodes for all links after loading a file."""
+        # Remove stale externalPool nodes first
+        stale = [nid for nid, n in self.model.nodes.items() if n.type == "externalPool"]
+        for nid in stale:
+            del self.model.nodes[nid]
+        for link in self.model.links:
+            path = link.get("file", "")
+            pid = link.get("process", "")
+            nid = link.get("node_id", self.model.gen_id("ExtPool"))
+            link["node_id"] = nid
+            label = f"{os.path.basename(path)}: {pid}"
+            if not os.path.exists(path):
+                label += " [missing]"
+            else:
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                    for p in d.get("processes", []):
+                        if p.get("id") == pid:
+                            label = f"{os.path.basename(path)}: {p.get('name', pid)}"
+                            break
+                except Exception:
+                    label += " [error]"
+            self.model.add_node_with_id(nid, "externalPool", 50, 50, 300, 80, label)
+
     def _build_main_area(self):
         self.main_wrap = tk.Frame(self, bg=self.BG)
         self.main_wrap.pack(side=tk.RIGHT, expand=True, fill=tk.BOTH)
@@ -529,6 +955,29 @@ class BPMNStudio(tk.Tk):
         self.canvas_area = tk.Frame(self.main_wrap, bg=self.BG)
         self.canvas_area.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
 
+        # Process tab bar
+        self._tab_bar = tk.Frame(self.canvas_area, bg="#e5e7eb", height=30)
+        self._tab_bar.pack(side=tk.TOP, fill=tk.X)
+        self._tab_bar.pack_propagate(False)
+
+        # Search bar (hidden by default)
+        self._search_frame = tk.Frame(self.canvas_area, bg="#fef9c3", pady=2)
+        self._search_var = tk.StringVar()
+        self._search_matches = []
+        self._search_match_idx = 0
+        tk.Label(self._search_frame, text="Find:", bg="#fef9c3").pack(side=tk.LEFT, padx=4)
+        self._search_entry = tk.Entry(self._search_frame, textvariable=self._search_var, width=30)
+        self._search_entry.pack(side=tk.LEFT, padx=2)
+        self._search_entry.bind("<Return>", lambda e: self._search_next())
+        self._search_entry.bind("<Escape>", lambda e: self._hide_search())
+        self._search_count_lbl = tk.Label(self._search_frame, text="", bg="#fef9c3", fg="#6b7280")
+        self._search_count_lbl.pack(side=tk.LEFT, padx=4)
+        tk.Button(self._search_frame, text="▲", command=self._search_prev, width=2).pack(side=tk.LEFT)
+        tk.Button(self._search_frame, text="▼", command=self._search_next, width=2).pack(side=tk.LEFT)
+        tk.Button(self._search_frame, text="✕", command=self._hide_search, width=2).pack(side=tk.LEFT, padx=4)
+        self._search_var.trace_add("write", lambda *_: self._update_search_highlights())
+        # search bar starts hidden — do NOT pack it here
+
         self.v_scroll = tk.Scrollbar(self.canvas_area, orient=tk.VERTICAL)
         self.h_scroll = tk.Scrollbar(self.canvas_area, orient=tk.HORIZONTAL)
         self.canvas = tk.Canvas(self.canvas_area, bg="#ffffff", highlightthickness=0,
@@ -539,6 +988,15 @@ class BPMNStudio(tk.Tk):
         self.h_scroll.config(command=self.canvas.xview)
         self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Minimap overlay
+        self._minimap = tk.Canvas(self.canvas, width=160, height=100,
+                                   bg="#f8fafc", highlightthickness=1,
+                                   highlightbackground="#94a3b8")
+        self._minimap.place(relx=1.0, rely=1.0, anchor="se", x=-12, y=-12)
+        self._minimap.bind("<Button-1>", self._minimap_click)
+        tk.Label(self._minimap, text="Map", bg="#f8fafc", fg="#94a3b8",
+                 font=("Arial", 7)).place(x=2, y=2)
 
         self.json_frame = tk.Frame(self.main_wrap, bg="#fdfdfd")
         self.json_text = tk.Text(self.json_frame, font=("Consolas", 11), undo=True, wrap="none")
@@ -817,7 +1275,7 @@ class BPMNStudio(tk.Tk):
         self._lane_handle_to_info.clear()
         self._draw_grid_now()
         for n in self.model.nodes.values():
-            if n.type == "pool":
+            if n.type in ("pool", "externalPool"):
                 self.draw_pool(n)
         for n in self.model.nodes.values():
             if n.type == "lane":
@@ -825,16 +1283,20 @@ class BPMNStudio(tk.Tk):
         for e in self.model.edges:
             self.draw_edge(e)
         for n in self.model.nodes.values():
-            if n.type not in ("lane", "pool"):
+            if n.type not in ("lane", "pool", "externalPool"):
                 self.draw_node(n)
         if self._active_lane_id and self._active_lane_id in self.model.nodes:
             self._draw_lane_handles(self.model.nodes[self._active_lane_id])
         self._update_scrollregion()
         self._stack_layers()
         self._draw_selection_overlays()
+        self._update_search_highlights()
+        self._refresh_minimap()
 
     # -------- Drawing
     def draw_pool(self, pool_node):
+        is_ext = pool_node.type == "externalPool"
+        dash_opts = {"dash": (6, 4)} if is_ext else {}
         x = self._mc(pool_node.x)
         y = self._mc(pool_node.y)
         w = self._mc(pool_node.w)
@@ -843,7 +1305,7 @@ class BPMNStudio(tk.Tk):
         rect = self.canvas.create_rectangle(
             x, y, x + w, y + h,
             fill=pool_node.fill, outline=pool_node.outline, width=2,
-            tags=("pool", f"pool:{pool_node.id}"),
+            tags=("pool", f"pool:{pool_node.id}"), **dash_opts,
         )
         label = self.canvas.create_text(
             x + self._mc(8), y + self._mc(16), text=pool_node.text, anchor='w',
@@ -938,6 +1400,27 @@ class BPMNStudio(tk.Tk):
             self._node_by_item[poly] = node.id
             self._label_by_item[marker] = (node.id, 'gateway_marker')
             self._label_by_item[text_label] = (node.id, 'node_label')
+
+        elif node.type == "annotation":
+            x2, y2 = self._mc(node.x), self._mc(node.y)
+            w2, h2 = self._mc(node.w), self._mc(node.h)
+            rect = self.canvas.create_rectangle(
+                x2, y2, x2 + w2, y2 + h2,
+                fill=node.fill, outline=node.fill, width=0, tags=tag,
+            )
+            border = self.canvas.create_line(
+                x2, y2, x2, y2 + h2,
+                fill=node.outline, width=3, tags=tag,
+            )
+            fs = max(6, int(10 * self._zoom))
+            label = self.canvas.create_text(
+                x2 + self._mc(8), y2 + h2 / 2,
+                text=node.text, anchor="w",
+                font=("Arial", fs), fill=node.text_color, tags=tag,
+            )
+            self._node_by_item[rect] = node.id
+            self._node_by_item[border] = node.id
+            self._label_by_item[label] = (node.id, "node_label")
 
         else:
             rect = self.canvas.create_rectangle(
@@ -1196,6 +1679,7 @@ class BPMNStudio(tk.Tk):
             'm': 'intermediateEvent',
             'l': 'lane',
             'o': 'pool',
+            'a': 'annotation',
             'c': 'connector',
             'f': 'msgConnector',
         }
@@ -1235,6 +1719,7 @@ class BPMNStudio(tk.Tk):
             self.canvas.xview_scroll(-1 * int(event.delta / 120), "units")
         else:
             self.canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+        self._refresh_minimap()
 
     def _on_mouse_wheel_linux_up(self, event):
         if event.state & 0x0004:
@@ -1243,6 +1728,7 @@ class BPMNStudio(tk.Tk):
             self.canvas.xview_scroll(-1, "units")
         else:
             self.canvas.yview_scroll(-1, "units")
+        self._refresh_minimap()
 
     def _on_mouse_wheel_linux_down(self, event):
         if event.state & 0x0004:
@@ -1251,6 +1737,7 @@ class BPMNStudio(tk.Tk):
             self.canvas.xview_scroll(1, "units")
         else:
             self.canvas.yview_scroll(1, "units")
+        self._refresh_minimap()
 
     # -------- Events
     def on_left_click(self, event):
@@ -1298,11 +1785,19 @@ class BPMNStudio(tk.Tk):
 
         if tool == "select":
             if clicked_kind is None:
-                # Start rubber-band on empty canvas
-                self._multi_select.clear()
-                self._rubber_band_start = (cx, cy)
-                self._rubber_band_item = None
-                self._draw_selection_overlays()
+                ctrl_held = bool(event.state & 0x0004)
+                if ctrl_held:
+                    # Ctrl+drag → start rubber-band selection
+                    mx, my = self._cm(cx), self._cm(cy)
+                    self._rubber_band_start = (mx, my)
+                    self._rubber_band_item = self.canvas.create_rectangle(
+                        cx, cy, cx, cy,
+                        outline="#2563eb", width=1, dash=(4, 3), tags=("sel_indicator",)
+                    )
+                else:
+                    # Plain drag → pan canvas
+                    self.canvas.scan_mark(event.x, event.y)
+                    self._panning = True
                 return
 
             if clicked_kind == "lane":
@@ -1367,7 +1862,7 @@ class BPMNStudio(tk.Tk):
         # Tool: add node
         node_tools = ("startEvent", "endEvent", "task", "exclusiveGateway",
                       "parallelGateway", "inclusiveGateway", "intermediateEvent",
-                      "lane", "pool")
+                      "lane", "pool", "annotation", "externalPool")
         if tool in node_tools:
             self._multi_select.clear()
             if tool in ("startEvent", "endEvent", "intermediateEvent"):
@@ -1422,16 +1917,21 @@ class BPMNStudio(tk.Tk):
     def on_drag(self, event):
         if self.view_mode != "bpmn":
             return
+        if getattr(self, '_panning', False):
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+            return
         cx, cy = self._event_xy_canvas(event)
         mx, my = self._cm(cx), self._cm(cy)
 
         # Rubber-band selection
         if self._rubber_band_start is not None:
             rbx, rby = self._rubber_band_start
+            # _rubber_band_start stores model coords; convert to canvas
+            rbcx, rbcy = self._mc(rbx), self._mc(rby)
             if self._rubber_band_item:
                 self.canvas.delete(self._rubber_band_item)
             self._rubber_band_item = self.canvas.create_rectangle(
-                rbx, rby, cx, cy,
+                rbcx, rbcy, cx, cy,
                 outline="#2563eb", width=1, dash=(4, 3), fill="",
                 tags=("sel_indicator",),
             )
@@ -1558,15 +2058,19 @@ class BPMNStudio(tk.Tk):
         self._changed_during_drag = True
 
     def on_release(self, event):
+        if getattr(self, '_panning', False):
+            self._panning = False
+            return
+
         # Finish rubber-band selection
         if self._rubber_band_start is not None:
             cx, cy = self._event_xy_canvas(event)
             rbx, rby = self._rubber_band_start
-            # Convert to model coords
-            x1m = self._cm(min(rbx, cx))
-            y1m = self._cm(min(rby, cy))
-            x2m = self._cm(max(rbx, cx))
-            y2m = self._cm(max(rby, cy))
+            # _rubber_band_start stores model coords
+            x1m = min(rbx, self._cm(cx))
+            y1m = min(rby, self._cm(cy))
+            x2m = max(rbx, self._cm(cx))
+            y2m = max(rby, self._cm(cy))
             # Find nodes whose bbox intersects the rubber-band
             for nid, n in self.model.nodes.items():
                 if n.type in ("lane", "pool"):
@@ -2045,6 +2549,7 @@ class BPMNStudio(tk.Tk):
         else:
             self.toggle_view_json()
         self._update_window_title()
+        self._update_process_tabs()
         self._history.clear()
         self._redo.clear()
         self._push_history("init")
@@ -2072,6 +2577,7 @@ class BPMNStudio(tk.Tk):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             self.current_file = path
+            self._add_recent_file(path)
             self._dirty = False
             self._update_window_title()
             self._flash_message(f"Saved: {path}")
@@ -2095,10 +2601,14 @@ class BPMNStudio(tk.Tk):
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
         if not path:
             return
+        self._do_open_json(path)
+
+    def _do_open_json(self, path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.model.load_json(data)
+            self._load_external_links()
             self.current_file = path
             self._active_lane_id = None
             self._clear_lane_handles()
@@ -2108,6 +2618,8 @@ class BPMNStudio(tk.Tk):
                 self.redraw_all()
             else:
                 self.toggle_view_json()
+            self._update_process_tabs()
+            self._add_recent_file(path)
             self._flash_message(f"Opened: {path}")
             self._update_window_title()
             self._history.clear()
@@ -2242,6 +2754,7 @@ class BPMNStudio(tk.Tk):
                 ("sendTask", "task"),
                 ("receiveTask", "task"),
                 ("callActivity", "task"),
+                ("textAnnotation", "annotation"),
             ]
             for tag, ntype in node_tags:
                 for el in findall(proc, tag):
@@ -2354,6 +2867,10 @@ class BPMNStudio(tk.Tk):
             elif node.type == "task":
                 task_tag = node.subtype if node.subtype else "userTask"
                 el = E(task_tag, id=node.id, name=name_attr)
+            elif node.type == "annotation":
+                el = E("textAnnotation", id=node.id)
+                txt = ET.SubElement(el, self.q("text"))
+                txt.text = node.text or ""
             else:
                 return None
             for inc in filter(None, node.incoming):
