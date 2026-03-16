@@ -28,6 +28,12 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 # ----------------------------- Data Model ------------------------------------
 class Node:
     def __init__(self, nid, ntype, x, y, w=120, h=60, text=None, lane_id=None,
@@ -50,6 +56,7 @@ class Node:
         self.outgoing = []
         self.next = []
         self.prev = []
+        self.annotation = None
 
     def ensure_defaults_for_type(self):
         if self.type == "pool":
@@ -117,6 +124,7 @@ class Node:
             "next": self.next,
             "prev": self.prev,
             "style": {"fill": self.fill, "outline": self.outline, "text": self.text_color},
+            "annotation": self.annotation or None,
         }
 
 
@@ -128,6 +136,7 @@ class Edge:
         self.tgt = tgt
         self.name = label or ""
         self.condition = None
+        self.annotation = None
 
     def to_dict(self):
         return {
@@ -137,6 +146,7 @@ class Edge:
             "to": self.tgt,
             "name": self.name,
             "condition": self.condition,
+            "annotation": self.annotation or None,
         }
 
 
@@ -294,7 +304,7 @@ class BPMNModel:
                 n = self.nodes[target.tgt]
                 n.incoming = [i for i in n.incoming if i != eid]
                 n.prev = [p for p in n.prev if p != target.src]
-        self.edges = kept
+        self.edges[:] = kept
 
     def to_json(self):
         return {
@@ -337,6 +347,7 @@ class BPMNModel:
                     text_color=style.get("text"),
                 )
                 node.subtype = nd.get("subtype")
+                node.annotation = nd.get("annotation") or None
                 node.ensure_defaults_for_type()
                 node.incoming = [str(x) for x in (nd.get("incoming", []) or []) if x is not None]
                 node.outgoing = [str(x) for x in (nd.get("outgoing", []) or []) if x is not None]
@@ -350,6 +361,7 @@ class BPMNModel:
                 e = Edge(ed.get("id"), ed.get("from"), ed.get("to"), ed.get("name"),
                          etype=ed.get("type", "sequenceFlow"))
                 e.condition = ed.get("condition")
+                e.annotation = ed.get("annotation") or None
                 proc["edges"].append(e)
                 if e.id:
                     parts = e.id.rsplit("_", 1)
@@ -404,6 +416,10 @@ class BPMNStudio(tk.Tk):
         self._lane_handle_to_info = {}
         self._resizing_lane = None
         self._dragging_lane = None
+        self._dragging_pool = None
+        self._pool_handle_to_info = {}
+        self._resizing_pool = None
+        self._active_pool_id = None
         self._panning = False
 
         # Multi-select state
@@ -435,6 +451,14 @@ class BPMNStudio(tk.Tk):
 
         # Minimap
         self._minimap_visible = tk.BooleanVar(value=True)
+
+        # Chat / AI assistant state
+        self._chat_history = []
+        self._chat_mode = tk.StringVar(value="process")
+        self._claude_api_key = ""
+        self._repo_folder = ""
+        self._chat_streaming = False
+        self._chat_tab_btns = {}
 
         # Build UI
         self._build_menu()
@@ -568,9 +592,6 @@ class BPMNStudio(tk.Tk):
         tk.Label(self.toolbar, text="Connect:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
         add_btn("Sequence Flow", "connector", "c")
         add_btn("Message Flow", "msgConnector", "f")
-        tk.Label(self.toolbar, text="Annotate:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
-        add_btn("Annotation", "annotation", "a")
-
         tk.Label(self.toolbar, text="Zoom:", bg="#ffffff", anchor="w").pack(fill="x", pady=(12, 2))
         zoom_frame = tk.Frame(self.toolbar, bg="#ffffff")
         zoom_frame.pack(fill="x", pady=2)
@@ -599,6 +620,8 @@ class BPMNStudio(tk.Tk):
             with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             self._recent_files = cfg.get("recent_files", [])
+            self._claude_api_key = cfg.get("claude_api_key", "")
+            self._repo_folder = cfg.get("repo_folder", "")
         except Exception:
             self._recent_files = []
         self._rebuild_recent_menu()
@@ -612,6 +635,8 @@ class BPMNStudio(tk.Tk):
             except Exception:
                 pass
             cfg["recent_files"] = self._recent_files
+            cfg["claude_api_key"] = self._claude_api_key
+            cfg["repo_folder"] = self._repo_folder
             with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=2)
         except Exception:
@@ -682,6 +707,8 @@ class BPMNStudio(tk.Tk):
         self.model.active_process_idx = idx
         self._active_lane_id = None
         self._clear_lane_handles()
+        self._active_pool_id = None
+        self._clear_pool_handles()
         self._multi_select.clear()
         self._selected_item = None
         self.redraw_all()
@@ -978,9 +1005,20 @@ class BPMNStudio(tk.Tk):
         self._search_var.trace_add("write", lambda *_: self._update_search_highlights())
         # search bar starts hidden — do NOT pack it here
 
-        self.v_scroll = tk.Scrollbar(self.canvas_area, orient=tk.VERTICAL)
-        self.h_scroll = tk.Scrollbar(self.canvas_area, orient=tk.HORIZONTAL)
-        self.canvas = tk.Canvas(self.canvas_area, bg="#ffffff", highlightthickness=0,
+        # Vertical PanedWindow: canvas on top (~80%), chat on bottom (~20%)
+        self._canvas_chat_pane = tk.PanedWindow(
+            self.canvas_area, orient=tk.VERTICAL,
+            sashwidth=6, sashrelief="raised", bg="#e5e7eb",
+        )
+        self._canvas_chat_pane.pack(side=tk.TOP, expand=True, fill=tk.BOTH)
+
+        # Top pane: canvas + scrollbars
+        canvas_wrap = tk.Frame(self._canvas_chat_pane, bg=self.BG)
+        self._canvas_chat_pane.add(canvas_wrap, stretch="always", minsize=150)
+
+        self.v_scroll = tk.Scrollbar(canvas_wrap, orient=tk.VERTICAL)
+        self.h_scroll = tk.Scrollbar(canvas_wrap, orient=tk.HORIZONTAL)
+        self.canvas = tk.Canvas(canvas_wrap, bg="#ffffff", highlightthickness=0,
                                 xscrollcommand=self.h_scroll.set,
                                 yscrollcommand=self.v_scroll.set)
         self.canvas.pack(side=tk.TOP, expand=True, fill=tk.BOTH)
@@ -997,6 +1035,14 @@ class BPMNStudio(tk.Tk):
         self._minimap.bind("<Button-1>", self._minimap_click)
         tk.Label(self._minimap, text="Map", bg="#f8fafc", fg="#94a3b8",
                  font=("Arial", 7)).place(x=2, y=2)
+
+        # Bottom pane: Claude AI chat panel
+        chat_frame = tk.Frame(self._canvas_chat_pane, bg="#0f172a")
+        self._canvas_chat_pane.add(chat_frame, stretch="never", minsize=120)
+        self._build_chat_panel(chat_frame)
+
+        # Set initial sash position (80/20 split) once window is rendered
+        self.after(80, self._set_initial_chat_sash)
 
         self.json_frame = tk.Frame(self.main_wrap, bg="#fdfdfd")
         self.json_text = tk.Text(self.json_frame, font=("Consolas", 11), undo=True, wrap="none")
@@ -1029,6 +1075,235 @@ class BPMNStudio(tk.Tk):
         tk.Label(self.prop_content, text="Select an item\nto view properties",
                  bg="#1e293b", fg="#64748b", font=("Arial", 10),
                  justify="center").pack(pady=40)
+
+    # -------- Chat panel (Claude AI assistant)
+
+    def _set_initial_chat_sash(self):
+        h = self._canvas_chat_pane.winfo_height()
+        if h > 1:
+            self._canvas_chat_pane.sash_place(0, 0, int(h * 0.8))
+        else:
+            self.after(100, self._set_initial_chat_sash)
+
+    def _build_chat_panel(self, parent):
+        """Build the Claude AI chat interface in the bottom pane."""
+        # Header / tab bar
+        header = tk.Frame(parent, bg="#0f172a", height=36)
+        header.pack(side=tk.TOP, fill=tk.X)
+        header.pack_propagate(False)
+
+        for mode, label in (("process", "Current Process"), ("repository", "Process Repository")):
+            btn = tk.Button(
+                header, text=label, relief="flat", font=("Arial", 9, "bold"),
+                padx=12, pady=0, cursor="hand2",
+                command=lambda m=mode: self._set_chat_mode(m),
+            )
+            btn.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0))
+            self._chat_tab_btns[mode] = btn
+
+        tk.Button(header, text="Clear", relief="flat", bg="#0f172a", fg="#64748b",
+                  font=("Arial", 8), padx=6, cursor="hand2",
+                  command=self._clear_chat).pack(side=tk.RIGHT, padx=2)
+        tk.Button(header, text="API Key…", relief="flat", bg="#0f172a", fg="#64748b",
+                  font=("Arial", 8), padx=6, cursor="hand2",
+                  command=self._set_api_key).pack(side=tk.RIGHT, padx=2)
+        tk.Button(header, text="Set Folder…", relief="flat", bg="#0f172a", fg="#64748b",
+                  font=("Arial", 8), padx=6, cursor="hand2",
+                  command=self._pick_repo_folder).pack(side=tk.RIGHT, padx=2)
+
+        self._refresh_chat_tabs()
+
+        # Input bar — must be packed BEFORE the expanding display area
+        input_bar = tk.Frame(parent, bg="#0f172a", pady=6)
+        input_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self._chat_input = tk.Text(
+            input_bar, height=2, bg="#1e293b", fg="#f8fafc",
+            font=("Arial", 10), wrap="word", relief="flat",
+            insertbackground="#f8fafc", padx=6, pady=4,
+        )
+        self._chat_input.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(8, 4))
+        self._chat_input.bind("<Return>", self._on_chat_enter)
+
+        self._chat_send_btn = tk.Button(
+            input_bar, text="Send", command=self._send_chat_message,
+            bg="#2563eb", fg="#ffffff", relief="flat",
+            font=("Arial", 10, "bold"), padx=14, pady=4, cursor="hand2",
+        )
+        self._chat_send_btn.pack(side=tk.RIGHT, padx=(0, 8))
+
+        # Chat display — packed after input so it fills remaining space
+        display_wrap = tk.Frame(parent, bg="#1e293b")
+        display_wrap.pack(side=tk.TOP, expand=True, fill=tk.BOTH)
+
+        self._chat_display = tk.Text(
+            display_wrap, bg="#1e293b", fg="#e2e8f0", font=("Arial", 10),
+            wrap="word", state="disabled", relief="flat", padx=10, pady=6,
+            cursor="arrow", selectbackground="#334155",
+        )
+        chat_vsb = tk.Scrollbar(display_wrap, command=self._chat_display.yview)
+        self._chat_display.configure(yscrollcommand=chat_vsb.set)
+        chat_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._chat_display.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
+
+        self._chat_display.tag_config("user_label", foreground="#60a5fa", font=("Arial", 9, "bold"))
+        self._chat_display.tag_config("user_text",  foreground="#bfdbfe", font=("Arial", 10))
+        self._chat_display.tag_config("ai_label",   foreground="#34d399", font=("Arial", 9, "bold"))
+        self._chat_display.tag_config("ai_text",    foreground="#e2e8f0", font=("Arial", 10))
+        self._chat_display.tag_config("sys_text",   foreground="#64748b",  font=("Arial", 9, "italic"))
+
+        self._append_chat("sys", "Claude AI assistant — select a context tab above and start chatting.")
+
+    def _refresh_chat_tabs(self):
+        mode = self._chat_mode.get()
+        for m, btn in self._chat_tab_btns.items():
+            if m == mode:
+                btn.config(bg="#1e293b", fg="#f8fafc")
+            else:
+                btn.config(bg="#0f172a", fg="#475569")
+
+    def _set_chat_mode(self, mode):
+        self._chat_mode.set(mode)
+        self._refresh_chat_tabs()
+
+    def _get_chat_context(self):
+        """Build context string for the current tab mode."""
+        if self._chat_mode.get() == "process":
+            parts = [f"Current BPMN process:\n{json.dumps(self.model.to_json(), indent=2)}"]
+            for link in self.model.links:
+                fpath = link.get("file")
+                if fpath and os.path.exists(fpath):
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as f:
+                            parts.append(
+                                f"Linked process ({os.path.basename(fpath)}):\n"
+                                f"{json.dumps(json.load(f), indent=2)}"
+                            )
+                    except Exception:
+                        pass
+            return "\n\n".join(parts)
+        else:
+            if not self._repo_folder or not os.path.isdir(self._repo_folder):
+                return "(No repository folder selected — click 'Set Folder…' to choose one.)"
+            parts = []
+            for fname in sorted(os.listdir(self._repo_folder)):
+                if fname.endswith(".json"):
+                    try:
+                        with open(os.path.join(self._repo_folder, fname), "r", encoding="utf-8") as f:
+                            parts.append(f"Process: {fname}\n{json.dumps(json.load(f), indent=2)}")
+                    except Exception:
+                        pass
+            return "\n\n---\n\n".join(parts) if parts else "(No JSON files found in repository folder.)"
+
+    def _on_chat_enter(self, event):
+        if event.state & 0x0001:   # Shift+Enter → newline
+            return
+        self._send_chat_message()
+        return "break"
+
+    def _send_chat_message(self):
+        if not ANTHROPIC_AVAILABLE:
+            self._append_chat("sys", "Error: 'anthropic' package not installed. Run: pip install anthropic")
+            return
+        if not self._claude_api_key:
+            self._append_chat("sys", "No API key set — click 'API Key…' to configure.")
+            return
+        if self._chat_streaming:
+            return
+        msg = self._chat_input.get("1.0", "end-1c").strip()
+        if not msg:
+            return
+        self._chat_input.delete("1.0", "end")
+        self._append_chat("user", msg)
+        self._chat_history.append({"role": "user", "content": msg})
+        self._chat_streaming = True
+        self._chat_send_btn.config(state="disabled", text="…")
+        import threading
+        threading.Thread(target=self._claude_stream_request, daemon=True).start()
+
+    def _claude_stream_request(self):
+        """Run in background thread: stream a Claude response."""
+        try:
+            context = self._get_chat_context()
+            system_prompt = (
+                "You are a BPMN process analyst assistant. Help the user understand, analyse, "
+                "and improve their business process models. The user's process data (JSON) follows.\n\n"
+                + context
+            )
+            client = anthropic.Anthropic(api_key=self._claude_api_key)
+            self.after(0, self._begin_ai_response)
+            full_reply = ""
+            with client.messages.stream(
+                model="claude-opus-4-6",
+                max_tokens=4096,
+                system=system_prompt,
+                messages=self._chat_history,
+            ) as stream:
+                for chunk in stream.text_stream:
+                    full_reply += chunk
+                    self.after(0, self._append_stream_chunk, chunk)
+            self._chat_history.append({"role": "assistant", "content": full_reply})
+            self.after(0, self._end_ai_response)
+        except Exception as e:
+            self.after(0, self._append_chat, "sys", f"Error: {e}")
+            self.after(0, self._end_ai_response)
+
+    def _begin_ai_response(self):
+        self._chat_display.config(state="normal")
+        self._chat_display.insert("end", "Claude: ", "ai_label")
+        self._chat_display.config(state="disabled")
+        self._chat_display.see("end")
+
+    def _append_stream_chunk(self, text):
+        self._chat_display.config(state="normal")
+        self._chat_display.insert("end", text, "ai_text")
+        self._chat_display.config(state="disabled")
+        self._chat_display.see("end")
+
+    def _end_ai_response(self):
+        self._chat_display.config(state="normal")
+        self._chat_display.insert("end", "\n\n", "ai_text")
+        self._chat_display.config(state="disabled")
+        self._chat_display.see("end")
+        self._chat_streaming = False
+        self._chat_send_btn.config(state="normal", text="Send")
+
+    def _append_chat(self, role, text):
+        self._chat_display.config(state="normal")
+        if role == "user":
+            self._chat_display.insert("end", "You: ", "user_label")
+            self._chat_display.insert("end", text + "\n\n", "user_text")
+        else:
+            self._chat_display.insert("end", text + "\n\n", "sys_text")
+        self._chat_display.config(state="disabled")
+        self._chat_display.see("end")
+
+    def _set_api_key(self):
+        key = simpledialog.askstring(
+            "Claude API Key", "Enter your Anthropic API key:",
+            initialvalue=self._claude_api_key, parent=self,
+        )
+        if key is not None:
+            self._claude_api_key = key.strip()
+            self._save_recent_files()
+
+    def _pick_repo_folder(self):
+        folder = filedialog.askdirectory(
+            title="Select Process Repository Folder",
+            initialdir=self._repo_folder or os.path.expanduser("~"),
+            parent=self,
+        )
+        if folder:
+            self._repo_folder = folder
+            self._save_recent_files()
+            self._append_chat("sys", f"Repository folder: {folder}")
+
+    def _clear_chat(self):
+        self._chat_history.clear()
+        self._chat_display.config(state="normal")
+        self._chat_display.delete("1.0", "end")
+        self._chat_display.config(state="disabled")
+        self._append_chat("sys", "Chat cleared.")
 
     def _update_properties_panel(self, obj_id, kind):
         """Populate the properties panel for the selected object."""
@@ -1110,6 +1385,24 @@ class BPMNStudio(tk.Tk):
             make_colour_row("Outline", "outline", node.outline)
             make_colour_row("Text", "text_color", node.text_color)
 
+            # Annotation field
+            tk.Label(self.prop_content, text="Annotation", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(10, 1))
+            annot_text = tk.Text(self.prop_content, height=6, bg="#334155", fg="#f8fafc",
+                                 insertbackground="#f8fafc", relief="flat",
+                                 font=("Arial", 9), wrap="word")
+            annot_text.pack(fill="x", pady=(0, 6))
+            if node.annotation:
+                annot_text.insert("1.0", node.annotation)
+
+            def on_annot_change(*_, nid=obj_id, widget=annot_text):
+                n = self.model.nodes.get(nid)
+                if n:
+                    val = widget.get("1.0", "end-1c")
+                    n.annotation = val if val.strip() else None
+
+            annot_text.bind("<KeyRelease>", on_annot_change)
+            
         elif kind == "edge":
             edge = next((e for e in self.model.edges if e.id == obj_id), None)
             if not edge:
@@ -1170,6 +1463,24 @@ class BPMNStudio(tk.Tk):
                      font=("Arial", 9), anchor="w").pack(fill="x", pady=(4, 1))
             tk.Label(self.prop_content, text=edge.id, bg="#1e293b", fg="#64748b",
                      font=("Arial", 8), anchor="w", wraplength=200).pack(fill="x")
+
+            # Annotation field
+            tk.Label(self.prop_content, text="Annotation", bg="#1e293b", fg="#94a3b8",
+                     font=("Arial", 9), anchor="w").pack(fill="x", pady=(10, 1))
+            annot_text = tk.Text(self.prop_content, height=4, bg="#334155", fg="#f8fafc",
+                                 insertbackground="#f8fafc", relief="flat",
+                                 font=("Arial", 9), wrap="word")
+            annot_text.pack(fill="x", pady=(0, 6))
+            if edge.annotation:
+                annot_text.insert("1.0", edge.annotation)
+
+            def on_edge_annot_change(*_, eid=obj_id, widget=annot_text):
+                e2 = next((ex for ex in self.model.edges if ex.id == eid), None)
+                if e2:
+                    val = widget.get("1.0", "end-1c")
+                    e2.annotation = val if val.strip() else None
+
+            annot_text.bind("<KeyRelease>", on_edge_annot_change)
         else:
             self._show_prop_placeholder()
 
@@ -1240,13 +1551,14 @@ class BPMNStudio(tk.Tk):
 
     def _stack_layers(self):
         try:
-            for tag in ('grid', 'pool', 'lane', 'edge', 'node', 'lane_handle', 'sel_indicator'):
+            for tag in ('grid', 'pool', 'lane', 'edge', 'node', 'pool_handle', 'lane_handle', 'sel_indicator'):
                 self.canvas.tag_lower(tag)
             self.canvas.tag_raise('grid')
             self.canvas.tag_raise('pool')
             self.canvas.tag_raise('lane')
             self.canvas.tag_raise('edge')
             self.canvas.tag_raise('node')
+            self.canvas.tag_raise('pool_handle')
             self.canvas.tag_raise('lane_handle')
             self.canvas.tag_raise('sel_indicator')
         except Exception:
@@ -1264,6 +1576,18 @@ class BPMNStudio(tk.Tk):
             if (lane.x <= n.x and lane.y <= n.y and
                     (n.x + n.w) <= (lane.x + lane.w) and
                     (n.y + n.h) <= (lane.y + lane.h)):
+                result.append(n)
+        return result
+
+    def _nodes_in_pool(self, pool):
+        """Return all lanes and non-pool nodes whose bounding box is inside the given pool."""
+        result = []
+        for n in self.model.nodes.values():
+            if n is pool or n.type in ("pool", "externalPool"):
+                continue
+            if (pool.x <= n.x and pool.y <= n.y and
+                    (n.x + n.w) <= (pool.x + pool.w) and
+                    (n.y + n.h) <= (pool.y + pool.h)):
                 result.append(n)
         return result
 
@@ -1551,6 +1875,48 @@ class BPMNStudio(tk.Tk):
             self._lane_handle_to_info[r] = (lane_node.id, anchor)
         self._stack_layers()
 
+    # -------- Pool handles (resize)
+    def _clear_pool_handles(self):
+        for item in list(self._pool_handle_to_info.keys()):
+            self.canvas.delete(item)
+        self._pool_handle_to_info.clear()
+
+    def _draw_pool_handles(self, pool_node):
+        self._clear_pool_handles()
+        x = self._mc(pool_node.x)
+        y = self._mc(pool_node.y)
+        w = self._mc(pool_node.w)
+        h = self._mc(pool_node.h)
+        cx, cy = x + w / 2, y + h / 2
+        pts = {
+            "nw": (x, y), "n": (cx, y), "ne": (x + w, y),
+            "e": (x + w, cy), "se": (x + w, y + h),
+            "s": (cx, y + h), "sw": (x, y + h), "w": (x, cy),
+        }
+        size = max(4, int(8 * self._zoom))
+        for anchor, (hx, hy) in pts.items():
+            r = self.canvas.create_rectangle(
+                hx - size / 2, hy - size / 2, hx + size / 2, hy + size / 2,
+                fill="#2563eb", outline="#1e3a8a", tags=("pool_handle",),
+            )
+            self._pool_handle_to_info[r] = (pool_node.id, anchor)
+        self._stack_layers()
+
+    def _update_pool_graphics(self, pool_node):
+        x = self._mc(pool_node.x)
+        y = self._mc(pool_node.y)
+        w = self._mc(pool_node.w)
+        h = self._mc(pool_node.h)
+        items = self.canvas.find_withtag(f"pool:{pool_node.id}")
+        for it in items:
+            t = self.canvas.type(it)
+            if t == 'rectangle':
+                self.canvas.coords(it, x, y, x + w, y + h)
+            elif t == 'text':
+                self.canvas.coords(it, x + self._mc(8), y + self._mc(16))
+        if self._active_pool_id == pool_node.id:
+            self._draw_pool_handles(pool_node)
+
     def _update_lane_graphics(self, lane_node):
         x = self._mc(lane_node.x)
         y = self._mc(lane_node.y)
@@ -1603,6 +1969,8 @@ class BPMNStudio(tk.Tk):
 
     # -------- Selection & Interaction
     def get_item_kind(self, item_id):
+        if item_id in self._pool_handle_to_info:
+            return "pool_handle"
         if item_id in self._lane_handle_to_info:
             return "lane_handle"
         if item_id in self._node_by_item:
@@ -1679,7 +2047,6 @@ class BPMNStudio(tk.Tk):
             'm': 'intermediateEvent',
             'l': 'lane',
             'o': 'pool',
-            'a': 'annotation',
             'c': 'connector',
             'f': 'msgConnector',
         }
@@ -1763,6 +2130,19 @@ class BPMNStudio(tk.Tk):
                     self._draw_selection_overlays()
                 return
 
+        # Pool handle resize begin
+        if clicked_kind == "pool_handle":
+            pool_id, anchor = self._pool_handle_to_info.get(item, (None, None))
+            if pool_id and pool_id in self.model.nodes:
+                pn = self.model.nodes[pool_id]
+                self._resizing_pool = {
+                    "pool_id": pool_id,
+                    "anchor": anchor,
+                    "start_mouse": (cx, cy),
+                    "start_geom": (pn.x, pn.y, pn.w, pn.h),
+                }
+            return
+
         # Lane handle resize begin
         if clicked_kind == "lane_handle":
             lane_id, anchor = self._lane_handle_to_info.get(item, (None, None))
@@ -1785,6 +2165,14 @@ class BPMNStudio(tk.Tk):
 
         if tool == "select":
             if clicked_kind is None:
+                self._active_lane_id = None
+                self._clear_lane_handles()
+                self._active_pool_id = None
+                self._clear_pool_handles()
+                self._selected_item = None
+                self._selected_type = None
+                self._multi_select.clear()
+                self._draw_selection_overlays()
                 ctrl_held = bool(event.state & 0x0004)
                 if ctrl_held:
                     # Ctrl+drag → start rubber-band selection
@@ -1820,6 +2208,8 @@ class BPMNStudio(tk.Tk):
                     self._dragging_lane = {'lane_id': nid, 'offset': (mx - ln.x, my - ln.y)}
                     self._selected_item = lane_item
                     self._selected_type = 'lane'
+                    self._active_pool_id = None
+                    self._clear_pool_handles()
                     self._draw_lane_handles(ln)
                     self._stack_layers()
                     self._multi_select.clear()
@@ -1827,9 +2217,28 @@ class BPMNStudio(tk.Tk):
                     self._update_properties_panel(nid, "lane")
                 return
 
-            # Node / pool / edge
+            # Pool drag — move the pool and all contained lanes/nodes
+            if clicked_kind == "pool":
+                nid = self._resolve_node_id_from_item(item)
+                if nid and nid in self.model.nodes:
+                    pn = self.model.nodes[nid]
+                    self._dragging_pool = {'pool_id': nid, 'offset': (mx - pn.x, my - pn.y)}
+                    self._selected_item = item
+                    self._selected_type = 'pool'
+                    self._active_lane_id = None
+                    self._clear_lane_handles()
+                    self._active_pool_id = nid
+                    self._draw_pool_handles(pn)
+                    self._multi_select.clear()
+                    self._draw_selection_overlays()
+                    self._update_properties_panel(nid, "pool")
+                return
+
+            # Node / edge
             self._active_lane_id = None
             self._clear_lane_handles()
+            self._active_pool_id = None
+            self._clear_pool_handles()
             self._selected_item = item
             self._selected_type = clicked_kind
 
@@ -1937,6 +2346,43 @@ class BPMNStudio(tk.Tk):
             )
             return
 
+        # Pool resizing
+        if self._resizing_pool:
+            pool_id = self._resizing_pool["pool_id"]
+            if pool_id not in self.model.nodes:
+                return
+            anchor = self._resizing_pool["anchor"]
+            scx, scy = self._resizing_pool["start_mouse"]
+            px, py, pw, ph = self._resizing_pool["start_geom"]
+            dcx, dcy = cx - scx, cy - scy
+            dx, dy = self._cm(dcx), self._cm(dcy)
+            nx, ny, nw, nh = px, py, pw, ph
+            minw, minh = 200, 80
+            if anchor in ("nw", "w", "sw"):
+                nx = px + dx
+                nw = pw - dx
+            if anchor in ("ne", "e", "se"):
+                nw = pw + dx
+            if anchor in ("nw", "n", "ne"):
+                ny = py + dy
+                nh = ph - dy
+            if anchor in ("sw", "s", "se"):
+                nh = ph + dy
+            if nw < minw:
+                if anchor in ("nw", "w", "sw"):
+                    nx = px + (pw - minw)
+                nw = minw
+            if nh < minh:
+                if anchor in ("nw", "n", "ne"):
+                    ny = py + (ph - minh)
+                nh = minh
+            pool = self.model.nodes[pool_id]
+            pool.x, pool.y, pool.w, pool.h = nx, ny, nw, nh
+            self._update_pool_graphics(pool)
+            self._draw_selection_overlays()
+            self._changed_during_drag = True
+            return
+
         # Lane resizing
         if self._resizing_lane:
             lane_id = self._resizing_lane["lane_id"]
@@ -1971,6 +2417,7 @@ class BPMNStudio(tk.Tk):
             lane = self.model.nodes[lane_id]
             lane.x, lane.y, lane.w, lane.h = nx, ny, nw, nh
             self._update_lane_graphics(lane)
+            self._draw_selection_overlays()
             self._changed_during_drag = True
             return
 
@@ -1999,6 +2446,36 @@ class BPMNStudio(tk.Tk):
                     if self._active_lane_id == lane_id:
                         self._draw_lane_handles(ln)
                     self._stack_layers()
+                    self._draw_selection_overlays()
+                    self._changed_during_drag = True
+            return
+
+        # Pool dragging — move the pool and all contained lanes/nodes
+        if self._dragging_pool:
+            pool_id = self._dragging_pool.get('pool_id')
+            if pool_id and pool_id in self.model.nodes:
+                pn = self.model.nodes[pool_id]
+                offx, offy = self._dragging_pool.get('offset', (0, 0))
+                nx, ny = self.snap(mx - offx, my - offy)
+                dx, dy = nx - pn.x, ny - pn.y
+                if dx or dy:
+                    children = self._nodes_in_pool(pn)
+                    pn.x, pn.y = nx, ny
+                    self.canvas.move(f"pool:{pool_id}", dx * self._zoom, dy * self._zoom)
+                    for n in children:
+                        n.x += dx
+                        n.y += dy
+                        tag = f"lane:{n.id}" if n.type == "lane" else f"node:{n.id}"
+                        self.canvas.move(tag, dx * self._zoom, dy * self._zoom)
+                    self.canvas.delete("edge")
+                    self._edge_by_item.clear()
+                    for e in self.model.edges:
+                        self.draw_edge(e)
+                    self._update_scrollregion()
+                    if self._active_pool_id == pool_id:
+                        self._draw_pool_handles(pn)
+                    self._stack_layers()
+                    self._draw_selection_overlays()
                     self._changed_during_drag = True
             return
 
@@ -2085,7 +2562,16 @@ class BPMNStudio(tk.Tk):
             self._draw_selection_overlays()
             return
 
-        if self._resizing_lane:
+        if self._resizing_pool:
+            self._resizing_pool = None
+            self._stack_layers()
+            self._update_scrollregion()
+            if self._active_pool_id and self._active_pool_id in self.model.nodes:
+                self._draw_pool_handles(self.model.nodes[self._active_pool_id])
+            if self._changed_during_drag:
+                self._push_history("resize pool")
+                self._changed_during_drag = False
+        elif self._resizing_lane:
             self._resizing_lane = None
             self._stack_layers()
             self._update_scrollregion()
@@ -2100,6 +2586,13 @@ class BPMNStudio(tk.Tk):
                 self._draw_lane_handles(self.model.nodes[self._active_lane_id])
             if self._changed_during_drag:
                 self._push_history("move lane")
+                self._changed_during_drag = False
+        elif self._dragging_pool:
+            self._dragging_pool = None
+            self._stack_layers()
+            self._update_scrollregion()
+            if self._changed_during_drag:
+                self._push_history("move pool")
                 self._changed_during_drag = False
         elif self._changed_during_drag:
             self._push_history("move node")
