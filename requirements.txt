@@ -3,3 +3,4 @@
 # - Pillow is optional, only needed if you want to export PNG (File → Export PNG…).
 Pillow>=10.0.0
 anthropic
+mistune>=3.0.0
