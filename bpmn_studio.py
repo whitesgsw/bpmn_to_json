@@ -371,6 +371,156 @@ class BPMNModel:
         self._counter = max_num + 1
 
 
+# ----------------------------- Markdown → Tkinter renderer -------------------
+
+class _TkMarkdownRenderer:
+    """Renders a mistune AST directly into a Tkinter Text widget."""
+
+    def __init__(self, widget):
+        self._d = widget
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+    def render(self, tokens):
+        for token in tokens:
+            self._block(token)
+
+    # ------------------------------------------------------------------
+    # Block-level tokens
+    # ------------------------------------------------------------------
+    def _block(self, token):
+        t = token.get("type")
+        if t == "heading":
+            level = token.get("attrs", {}).get("level", 1)
+            tag = f"ai_h{min(level, 3)}"
+            self._d.insert("end", self._collect(token.get("children", [])) + "\n", tag)
+        elif t == "paragraph":
+            self._inline_children(token.get("children", []))
+            self._d.insert("end", "\n\n", "ai_text")
+        elif t == "block_code":
+            self._d.insert("end", token.get("raw", "") + "\n\n", "ai_code_block")
+        elif t == "thematic_break":
+            self._d.insert("end", "─" * 48 + "\n", "ai_hr")
+        elif t == "list":
+            ordered = token.get("attrs", {}).get("ordered", False)
+            for idx, item in enumerate(token.get("children", [])):
+                if ordered:
+                    self._d.insert("end", f"  {idx + 1}. ", "ai_bullet_marker")
+                else:
+                    self._d.insert("end", "  • ", "ai_bullet_marker")
+                for child in item.get("children", []):
+                    ct = child["type"]
+                    if ct in ("paragraph", "block_text"):
+                        # block_text = tight list, paragraph = loose list
+                        self._inline_children(child.get("children", []))
+                    elif ct == "text":
+                        self._d.insert("end", child.get("raw", ""), "ai_text")
+                    else:
+                        self._block(child)
+                self._d.insert("end", "\n", "ai_text")
+            self._d.insert("end", "\n", "ai_text")
+        elif t == "table":
+            self._table(token)
+        elif t in ("blank_line", "newline"):
+            self._d.insert("end", "\n", "ai_text")
+        elif t == "block_quote":
+            for child in token.get("children", []):
+                self._block(child)
+
+    # ------------------------------------------------------------------
+    # Inline tokens
+    # ------------------------------------------------------------------
+    def _inline_children(self, children):
+        for token in children:
+            self._inline(token)
+
+    def _inline(self, token):
+        t = token.get("type")
+        if t == "text":
+            self._d.insert("end", token.get("raw", ""), "ai_text")
+        elif t == "strong":
+            self._d.insert("end", self._collect(token.get("children", [])), "ai_bold")
+        elif t == "emphasis":
+            self._d.insert("end", self._collect(token.get("children", [])), "ai_italic")
+        elif t == "codespan":
+            self._d.insert("end", token.get("raw", ""), "ai_inline_code")
+        elif t in ("softlinebreak", "linebreak"):
+            self._d.insert("end", "\n", "ai_text")
+        elif "children" in token:
+            self._inline_children(token["children"])
+        else:
+            raw = token.get("raw", "")
+            if raw:
+                self._d.insert("end", raw, "ai_text")
+
+    def _collect(self, tokens):
+        """Recursively extract plain text from a list of inline tokens."""
+        parts = []
+        for token in tokens:
+            if token.get("type") in ("text", "codespan"):
+                parts.append(token.get("raw", ""))
+            elif token.get("type") in ("softlinebreak", "linebreak"):
+                parts.append("\n")
+            elif "children" in token:
+                parts.append(self._collect(token["children"]))
+        return "".join(parts)
+
+    # ------------------------------------------------------------------
+    # Table rendering
+    # ------------------------------------------------------------------
+    def _table(self, token):
+        head_rows, body_rows = [], []
+        for child in token.get("children", []):
+            if child["type"] == "table_head":
+                for row in child.get("children", []):
+                    head_rows.append(self._extract_cells(row))
+            elif child["type"] == "table_body":
+                for row in child.get("children", []):
+                    body_rows.append(self._extract_cells(row))
+
+        all_rows = head_rows + body_rows
+        if not all_rows:
+            return
+
+        col_count = max(len(r) for r in all_rows)
+        col_widths = [0] * col_count
+        for row in all_rows:
+            for j, (plain, _) in enumerate(row):
+                col_widths[j] = max(col_widths[j], len(plain))
+
+        def insert_row(row, tag):
+            self._d.insert("end", " ", tag)
+            for j in range(col_count):
+                plain, children = row[j] if j < len(row) else ("", [])
+                self._inline_children(children)
+                pad = col_widths[j] - len(plain)
+                if pad > 0:
+                    self._d.insert("end", " " * pad, tag)
+                if j < col_count - 1:
+                    self._d.insert("end", " │ ", "ai_table_div")
+            self._d.insert("end", "\n", tag)
+
+        def insert_divider():
+            segs = ["─" * col_widths[j] for j in range(col_count)]
+            self._d.insert("end", " " + "─┼─".join(segs) + "\n", "ai_table_div")
+
+        for row in head_rows:
+            insert_row(row, "ai_table_header")
+        insert_divider()
+        for row in body_rows:
+            insert_row(row, "ai_table_cell")
+        self._d.insert("end", "\n", "ai_text")
+
+    def _extract_cells(self, row_token):
+        """Return [(plain_text, children_tokens), ...] for each cell in a row."""
+        cells = []
+        for cell in row_token.get("children", []):
+            children = cell.get("children", [])
+            cells.append((self._collect(children), children))
+        return cells
+
+
 # ----------------------------- GUI / Controller ------------------------------
 class BPMNStudio(tk.Tk):
     BG = "#f4f5f7"
@@ -1081,7 +1231,7 @@ class BPMNStudio(tk.Tk):
     def _set_initial_chat_sash(self):
         h = self._canvas_chat_pane.winfo_height()
         if h > 1:
-            self._canvas_chat_pane.sash_place(0, 0, int(h * 0.8))
+            self._canvas_chat_pane.sash_place(0, 0, int(h * 0.65))
         else:
             self.after(100, self._set_initial_chat_sash)
 
@@ -1146,11 +1296,29 @@ class BPMNStudio(tk.Tk):
         chat_vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self._chat_display.pack(side=tk.LEFT, expand=True, fill=tk.BOTH)
 
-        self._chat_display.tag_config("user_label", foreground="#60a5fa", font=("Arial", 9, "bold"))
-        self._chat_display.tag_config("user_text",  foreground="#bfdbfe", font=("Arial", 10))
-        self._chat_display.tag_config("ai_label",   foreground="#34d399", font=("Arial", 9, "bold"))
-        self._chat_display.tag_config("ai_text",    foreground="#e2e8f0", font=("Arial", 10))
-        self._chat_display.tag_config("sys_text",   foreground="#64748b",  font=("Arial", 9, "italic"))
+        self._chat_display.tag_config("user_label",      foreground="#60a5fa", font=("Arial", 9, "bold"))
+        self._chat_display.tag_config("user_text",       foreground="#bfdbfe", font=("Arial", 10))
+        self._chat_display.tag_config("ai_label",        foreground="#34d399", font=("Arial", 9, "bold"))
+        self._chat_display.tag_config("ai_text",         foreground="#e2e8f0", font=("Arial", 10))
+        self._chat_display.tag_config("ai_thinking",     foreground="#64748b", font=("Arial", 10, "italic"))
+        self._chat_display.tag_config("ai_h1",           foreground="#93c5fd", font=("Arial", 13, "bold"))
+        self._chat_display.tag_config("ai_h2",           foreground="#7dd3fc", font=("Arial", 12, "bold"))
+        self._chat_display.tag_config("ai_h3",           foreground="#67e8f9", font=("Arial", 11, "bold"))
+        self._chat_display.tag_config("ai_bold",         foreground="#f1f5f9", font=("Arial", 10, "bold"))
+        self._chat_display.tag_config("ai_italic",       foreground="#e2e8f0", font=("Arial", 10, "italic"))
+        self._chat_display.tag_config("ai_inline_code",  foreground="#86efac", font=("Consolas", 9),
+                                      background="#0f172a")
+        self._chat_display.tag_config("ai_code_block",   foreground="#86efac", font=("Consolas", 9),
+                                      background="#0f172a", lmargin1=16, lmargin2=16)
+        self._chat_display.tag_config("ai_bullet_marker", foreground="#34d399", font=("Arial", 10, "bold"))
+        self._chat_display.tag_config("ai_hr",            foreground="#334155", font=("Arial", 8))
+        self._chat_display.tag_config("ai_table_header",  foreground="#93c5fd", font=("Consolas", 9, "bold"),
+                                      background="#0f172a", lmargin1=8, lmargin2=8)
+        self._chat_display.tag_config("ai_table_div",     foreground="#334155", font=("Consolas", 9),
+                                      background="#0f172a", lmargin1=8, lmargin2=8)
+        self._chat_display.tag_config("ai_table_cell",    foreground="#e2e8f0", font=("Consolas", 9),
+                                      background="#0f172a", lmargin1=8, lmargin2=8)
+        self._chat_display.tag_config("sys_text",         foreground="#64748b", font=("Arial", 9, "italic"))
 
         self._append_chat("sys", "Claude AI assistant — select a context tab above and start chatting.")
 
@@ -1222,7 +1390,7 @@ class BPMNStudio(tk.Tk):
         threading.Thread(target=self._claude_stream_request, daemon=True).start()
 
     def _claude_stream_request(self):
-        """Run in background thread: stream a Claude response."""
+        """Run in background thread: wait for the full Claude response then render it."""
         try:
             context = self._get_chat_context()
             system_prompt = (
@@ -1232,41 +1400,52 @@ class BPMNStudio(tk.Tk):
             )
             client = anthropic.Anthropic(api_key=self._claude_api_key)
             self.after(0, self._begin_ai_response)
-            full_reply = ""
             with client.messages.stream(
                 model="claude-opus-4-6",
                 max_tokens=4096,
                 system=system_prompt,
                 messages=self._chat_history,
             ) as stream:
-                for chunk in stream.text_stream:
-                    full_reply += chunk
-                    self.after(0, self._append_stream_chunk, chunk)
+                message = stream.get_final_message()
+            full_reply = message.content[0].text
             self._chat_history.append({"role": "assistant", "content": full_reply})
-            self.after(0, self._end_ai_response)
+            self.after(0, self._display_ai_response, full_reply)
         except Exception as e:
             self.after(0, self._append_chat, "sys", f"Error: {e}")
             self.after(0, self._end_ai_response)
 
     def _begin_ai_response(self):
-        self._chat_display.config(state="normal")
-        self._chat_display.insert("end", "Claude: ", "ai_label")
-        self._chat_display.config(state="disabled")
-        self._chat_display.see("end")
+        d = self._chat_display
+        d.config(state="normal")
+        d.insert("end", "Claude: ", "ai_label")
+        d.mark_set("ai_response_start", "end")
+        d.mark_gravity("ai_response_start", "left")
+        d.insert("end", "Thinking…\n\n", "ai_thinking")
+        d.config(state="disabled")
+        d.see("end")
 
-    def _append_stream_chunk(self, text):
-        self._chat_display.config(state="normal")
-        self._chat_display.insert("end", text, "ai_text")
-        self._chat_display.config(state="disabled")
-        self._chat_display.see("end")
-
-    def _end_ai_response(self):
-        self._chat_display.config(state="normal")
-        self._chat_display.insert("end", "\n\n", "ai_text")
-        self._chat_display.config(state="disabled")
-        self._chat_display.see("end")
+    def _display_ai_response(self, text):
+        d = self._chat_display
+        d.config(state="normal")
+        d.delete("ai_response_start", "end")
+        self._render_markdown(text)
+        d.insert("end", "\n", "ai_text")
+        d.config(state="disabled")
+        d.see("end")
         self._chat_streaming = False
         self._chat_send_btn.config(state="normal", text="Send")
+
+    def _end_ai_response(self):
+        """Called only on error to reset the send button."""
+        self._chat_streaming = False
+        self._chat_send_btn.config(state="normal", text="Send")
+
+    def _render_markdown(self, text):
+        """Parse markdown with mistune and render the AST into _chat_display."""
+        import mistune
+        md = mistune.create_markdown(renderer="ast", plugins=["table", "strikethrough", "url"])
+        tokens = md(text)
+        _TkMarkdownRenderer(self._chat_display).render(tokens)
 
     def _append_chat(self, role, text):
         self._chat_display.config(state="normal")
@@ -2074,7 +2253,14 @@ class BPMNStudio(tk.Tk):
     def _pan_scan_dragto(self, event):
         self.canvas.scan_dragto(event.x, event.y, gain=1)
 
+    def _is_chat_widget(self, event):
+        """Return True if the scroll event originated from the chat display or input."""
+        w = event.widget
+        return w is getattr(self, "_chat_display", None) or w is getattr(self, "_chat_input", None)
+
     def _on_mouse_wheel(self, event):
+        if self._is_chat_widget(event):
+            return  # let the Text widget scroll itself
         # Ctrl+scroll = zoom
         if event.state & 0x0004:
             if event.delta > 0:
@@ -2089,6 +2275,8 @@ class BPMNStudio(tk.Tk):
         self._refresh_minimap()
 
     def _on_mouse_wheel_linux_up(self, event):
+        if self._is_chat_widget(event):
+            return
         if event.state & 0x0004:
             self.zoom_in()
         elif event.state & 0x0001:
@@ -2098,6 +2286,8 @@ class BPMNStudio(tk.Tk):
         self._refresh_minimap()
 
     def _on_mouse_wheel_linux_down(self, event):
+        if self._is_chat_widget(event):
+            return
         if event.state & 0x0004:
             self.zoom_out()
         elif event.state & 0x0001:
